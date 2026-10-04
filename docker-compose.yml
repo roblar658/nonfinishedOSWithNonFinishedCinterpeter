@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  custom-c-os:
+    build: .
+    image: custom-c-os:terminal
+    container_name: custom-cos-terminal
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/env
+    command: ["qemu-system-i386", "-fda", "/env/custom_c_os.img", "-boot", "a", "-nographic", "-monitor", "none"]

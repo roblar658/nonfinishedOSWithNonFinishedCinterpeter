@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+if [ -z "$1" ]; then
+    echo "Usage: cos-compile <file.c> [-o <binary>]"
+    exit 1
+fi
+INPUT="$1"
+BASE="${INPUT%.*}"
+OUTPUT="${2:-$BASE}"
+
+echo "[*] Step 1: Compiling $INPUT -> ${BASE}.asm using CustomC-OS x86-64 compiler..."
+/usr/local/bin/c_compiler "$INPUT" -o "${BASE}.asm"
+
+echo "[*] Step 2: Assembling ${BASE}.asm -> ${BASE}.o..."
+nasm -f elf64 "${BASE}.asm" -o "${BASE}.o"
+
+echo "[*] Step 3: Linking ${BASE}.o -> ${OUTPUT}..."
+gcc -no-pie "${BASE}.o" -o "${OUTPUT}"
+
+echo "[+] Build complete: ${OUTPUT}"

@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e
+if [ -z "$1" ]; then
+    echo "Usage: cos-run <file.c>"
+    exit 1
+fi
+INPUT="$1"
+BASE="${INPUT%.*}"
+cos-compile "$INPUT" "$BASE"
+echo "[*] Running $BASE:"
+echo "--------------------------------------------------"
+"./$BASE"
+CODE=$?
+echo ""
+echo "--------------------------------------------------"
+echo "[+] Program exited with code: $CODE"

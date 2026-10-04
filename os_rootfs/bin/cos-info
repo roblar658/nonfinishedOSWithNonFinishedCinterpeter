@@ -1,0 +1,10 @@
+#!/bin/bash
+cat /etc/os-release
+echo ""
+echo "=== System Architecture ==="
+uname -a
+echo ""
+echo "=== Installed Toolchain ==="
+gcc --version | head -n 1
+nasm -v
+python3 --version
