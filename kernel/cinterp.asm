@@ -1496,22 +1496,15 @@ ci_for:
     push ax                     ; [sp+6] = lagret exec
     push word [ci_var_count]    ; [sp+4]
     push word [ci_heap_top]     ; [sp+2]
-    mov al, [tok_type]
-    cmp al, ';'
+    cmp byte [tok_type], ';'
     je .init_empty
-    cmp al, K_INT
-    je .init_decl
-    cmp al, K_CHAR
-    je .init_decl
-    cmp al, K_DOUBLE
-    je .init_decl
-    cmp al, K_FLOAT
-    je .init_decl
+    call ci_consume_type
+    jnc .init_decl
     call ci_expr
     EXPECT ';'
     jmp .init_done
 .init_decl:
-    call ci_lex
+    mov [ci_cur_decl_type], al
     call ci_decl_rest
     jmp .init_done
 .init_empty:
@@ -1723,6 +1716,7 @@ ci_lor:
     setnz al
     movzx eax, al
     mov word [ci_lv], 0
+    mov word [ci_is_float], 0
     jmp .l
 .r:
     ret
@@ -1750,6 +1744,7 @@ ci_land:
     setnz al
     movzx eax, al
     mov word [ci_lv], 0
+    mov word [ci_is_float], 0
     jmp .l
 .r:
     ret
@@ -1765,12 +1760,49 @@ ci_equality:
     ret
 .op:
     push bx
+    push word [ci_is_float]
     push eax
     call ci_lex
     call ci_relational
     mov ecx, eax
     pop eax
+    pop dx
     pop bx
+    mov dh, [ci_is_float]
+    or dl, dh
+    jz .int_eq
+    mov word [ci_is_float], 0
+    call ci_to_float
+    call ci_ecx_to_float
+    mov [ci_f_tmp1], eax
+    mov [ci_f_tmp2], ecx
+    fld dword [ci_f_tmp2]
+    fld dword [ci_f_tmp1]
+    fcompp
+    fstsw ax
+    sahf
+    pushf
+    cmp bl, T_EQ
+    je .feq
+    popf
+    jne .ftrue
+    jmp .ffalse
+.feq:
+    popf
+    je .ftrue
+    jmp .ffalse
+.ftrue:
+    mov eax, 1
+    mov word [ci_lv], 0
+    mov word [ci_is_float], 0
+    jmp .l
+.ffalse:
+    xor eax, eax
+    mov word [ci_lv], 0
+    mov word [ci_is_float], 0
+    jmp .l
+.int_eq:
+    mov word [ci_is_float], 0
     cmp eax, ecx
     sete al
     movzx eax, al
@@ -1779,6 +1811,7 @@ ci_equality:
     xor eax, 1
 .s:
     mov word [ci_lv], 0
+    mov word [ci_is_float], 0
     jmp .l
 
 ci_to_float:
@@ -1953,10 +1986,12 @@ ci_relational:
 .f_true:
     mov eax, 1
     mov word [ci_lv], 0
+    mov word [ci_is_float], 0
     jmp .l
 .f_false:
     xor eax, eax
     mov word [ci_lv], 0
+    mov word [ci_is_float], 0
     jmp .l
 .int_rel:
     mov byte [ci_is_float], 0
@@ -1983,6 +2018,7 @@ ci_relational:
 .s:
     movzx eax, al
     mov word [ci_lv], 0
+    mov word [ci_is_float], 0
     jmp .l
 
 ci_additive:
@@ -2820,20 +2856,60 @@ ci_printf:
     add bx, bp
     mov ebx, [bx]
     inc dx
+.skip_len:
+    cmp al, 'l'
+    je .is_len
+    cmp al, 'h'
+    je .is_len
+    cmp al, 'z'
+    je .is_len
+    cmp al, 'j'
+    je .is_len
+    cmp al, 't'
+    je .is_len
+    cmp al, 'L'
+    je .is_len
+    jmp .spec_ready
+.is_len:
+    mov al, [si]
+    inc si
+    jmp .skip_len
+.spec_ready:
     cmp al, 'd'
     je .pd
     cmp al, 'i'
     je .pd
+    cmp al, 'u'
+    je .pu
     cmp al, 'c'
     je .pc
     cmp al, 's'
     je .ps
     cmp al, 'f'
     je .pf
+    cmp al, 'g'
+    je .pf
+    cmp al, 'e'
+    je .pf
     cmp al, 'x'
+    je .px
+    cmp al, 'X'
+    je .px
+    cmp al, 'p'
     je .px
     mov si, ci_e_spec
     jmp ci_error
+.pu:
+    push si
+    mov eax, ebx
+    call num_to_udec
+    cmp byte [ci_p_left], 1
+    je .pd_left
+    mov di, [ci_p_width]
+    call ci_pad
+    call ci_outs
+    pop si
+    jmp .fmt_loop
 .pd:
     push si
     mov eax, ebx
@@ -3062,6 +3138,13 @@ num_to_dec:                     ; EAX (signert) -> SI = streng, AX = lengde
     push ebx
     mov ebx, 10
     jmp num_conv
+num_to_udec:                    ; EAX (usignert) -> SI = streng, AX = lengde
+    push ebx
+    mov ebx, 10
+    push edx
+    push di
+    mov byte [num_neg], 0
+    jmp num_conv.pos_loop
 num_to_hex:                     ; EAX (usignert) -> SI = streng, AX = lengde
     push ebx
     mov ebx, 16
@@ -3070,12 +3153,12 @@ num_conv:
     push di
     mov byte [num_neg], 0
     cmp ebx, 10
-    jne .pos
+    jne .pos_loop
     test eax, eax
-    jns .pos
+    jns .pos_loop
     neg eax
     mov byte [num_neg], 1
-.pos:
+.pos_loop:
     mov di, numbuf + 15
     mov byte [di], 0
 .loop:
@@ -3319,7 +3402,7 @@ ci_func_count   dw 0
 ci_heap_top     dw 0
 ci_err_sp       dw 0
 ci_dummy        dd 0
-ci_is_float     db 0
+ci_is_float     dw 0
 ci_cur_decl_type db 0
 ci_f_tmp1       dd 0
 ci_f_tmp2       dd 0

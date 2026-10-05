@@ -1485,7 +1485,7 @@ display_generated_asm:
 ; Virtuelt Filsystem (In-Memory File System)
 ; ==============================================================================
 init_filesystem:
-    mov word [file_count], 8
+    mov word [file_count], 9
 
     ; 1. hello.c
     mov di, file_table + 0*16
@@ -1534,6 +1534,12 @@ init_filesystem:
     mov si, str_rk4_c
     call copy_str
     mov word [file_ptrs + 7*2], file_data_rk4
+
+    ; 9. lo.c
+    mov di, file_table + 8*16
+    mov si, str_lo_c
+    call copy_str
+    mov word [file_ptrs + 8*2], file_data_lo
 
     ; Klargjor editor-buffer
     mov word [edit_content_end], edit_content_buf
@@ -1942,6 +1948,7 @@ str_struct_c            db "struct_demo.c", 0
 str_qsort_c             db "quicksort.c", 0
 str_euler_c             db "euler.c", 0
 str_rk4_c               db "rk4.c", 0
+str_lo_c                db "lo.c", 0
 
 ; Forhandslagrede C-filer
 file_data_hello:
@@ -2169,6 +2176,32 @@ file_data_rk4:
     db "    double t_end = 2.0;", 13, 10
     db "    double h = 0.1;", 13, 10
     db "    rk4(f, t0, y0, t_end, h);", 13, 10
+    db "    return 0;", 13, 10
+    db "}", 13, 10, 0
+
+file_data_lo:
+    db "#include <stdio.h>", 13, 10
+    db "double beregn_kvadratrot(double n) {", 13, 10
+    db "    if (n <= 0.0) return 0.0;", 13, 10
+    db "    double x = n;", 13, 10
+    db "    for (int i = 0; i < 10; i++) {", 13, 10
+    db "        x = 0.5 * (x + n / x);", 13, 10
+    db "    }", 13, 10
+    db "    return x;", 13, 10
+    db "}", 13, 10
+    db "int main(void) {", 13, 10
+    db "    long lops_sum = 0;", 13, 10
+    db '    printf("+-----+------------+------------+---------------+------------+\n");', 13, 10
+    db '    printf("| %-3s | %-10s | %-10s | %-13s | %-10s |\n", "n", "Kvadrat", "Kubikk", "Kvadratrot", "Sum (1..n)");', 13, 10
+    db '    printf("+-----+------------+------------+---------------+------------+\n");', 13, 10
+    db "    for (int n = 1; n <= 10; n++) {", 13, 10
+    db "        long kvadrat = (long)n * n;", 13, 10
+    db "        long kubikk = (long)n * n * n;", 13, 10
+    db "        double rot = beregn_kvadratrot((double)n);", 13, 10
+    db "        lops_sum += n;", 13, 10
+    db '        printf("| %-3d | %-10ld | %-10ld | %-13.6f | %-10ld |\n", n, kvadrat, kubikk, rot, lops_sum);', 13, 10
+    db "    }", 13, 10
+    db '    printf("+-----+------------+------------+---------------+------------+\n");', 13, 10
     db "    return 0;", 13, 10
     db "}", 13, 10, 0
 

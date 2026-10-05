@@ -1,0 +1,13 @@
+# Build artifacts & Binaries
+*.bin
+*.img
+*.iso
+*.exe
+*.o
+*.obj
+bin/
+compiler/bin/
+
+# Logs & temp files
+*.log
+lo_out.txt
