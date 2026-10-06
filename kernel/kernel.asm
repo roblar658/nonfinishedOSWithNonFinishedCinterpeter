@@ -100,7 +100,9 @@ command_entered:
 init_serial:
     push dx
     push ax
-    ; Deaktiver avbrudd pa COM1
+    push es
+
+    ; Deaktiver avbrudd pa COM1 under oppsett
     mov dx, 0x3F9
     xor al, al
     out dx, al
@@ -118,39 +120,287 @@ init_serial:
     xor al, al
     out dx, al
 
-    ; 8 biter, ingen paritet, 1 stoppbit
+    ; 8 biter, ingen paritet, 1 stoppbit (slar ogsa av DLAB)
     mov dx, 0x3FB
     mov al, 0x03
     out dx, al
 
-    ; Aktiver FIFO, tom mottak/sending
+    ; Aktiver FIFO, tom mottak/sending, trigger level = 1 byte (0x07)
     mov dx, 0x3FA
-    mov al, 0xC7
+    mov al, 0x07
     out dx, al
 
-    ; Modemkontroll: DTR + RTS
+    ; Modemkontroll: DTR + RTS + OUT2 (0x0B)
+    ; MERK: OUT2 maa vaere satt for at UART skal koble avbruddslinjen til PIC IRQ4!
     mov dx, 0x3FC
     mov al, 0x0B
     out dx, al
 
+    ; Installer IRQ4-avbruddsvektor (INT 0x0C) i IVT (0x0000:0x0030)
+    ; og IRQ0-avbruddsvektor (INT 0x08) i IVT (0x0000:0x0020)
+    ; Dette eliminerer SeaBIOS sin handle_08/sercon_check_event fra a stjele COM1-bytes!
+    xor ax, ax
+    mov es, ax
+    cli
+    mov word [es:0x0030], serial_isr
+    mov word [es:0x0032], cs
+    mov word [es:0x0020], timer_isr
+    mov word [es:0x0022], cs
+    sti
+
+    ; Aktiver Received Data Available Interrupt pa COM1 (IER bit 0 = 0x01)
+    mov dx, 0x3F9
+    mov al, 0x01
+    out dx, al
+
+    ; Fjern maske for IRQ4 pa 8259A Master PIC (Port 0x21, bit 4 = 0)
+    in al, 0x21
+    and al, 0xEF
+    out 0x21, al
+
+    ; Tom eventuelle gamle tegn i mottaksregisteret
+    mov dx, 0x3FD
+    in al, dx
+    mov dx, 0x3F8
+    in al, dx
+
+    pop es
     pop ax
     pop dx
     ret
 
-term_putc:
+; ==============================================================================
+; IRQ4 Avbruddsrutine for Seriell COM1 (INT 0x0C)
+; Kjoeres automatisk i maskinvare i samme mikrosekund et tegn mottas pa COM1.
+; Legger alle innkommende tegn direkte i 32 KB ringbufferet, selv om CPU-en
+; er opptatt med a scrolle VGA-skjermen inne i BIOS INT 10h!
+; ==============================================================================
+; ==============================================================================
+; timer_isr (INT 0x08 / IRQ 0):
+; Erstatter SeaBIOS sin handle_08.
+; Hindrer at SeaBIOS sercon_check_event kjoeres og stjeler bytes fra COM1!
+; ==============================================================================
+timer_isr:
+    push ds
+    push ax
+    mov ax, 0x0040
+    mov ds, ax
+    inc dword [0x006C]          ; Oppdater BDA timer ticks
+    mov al, 0x20
+    out 0x20, al                ; Send EOI til Master PIC
+    pop ax
+    pop ds
+    iret
+
+; ==============================================================================
+; SPSC Lock-Free Ringbuffer: PRODUCER (Writer)
+; Kjoeres utelukkende i maskinvareavbrudd (IRQ4 / INT 0x0C).
+; Eneansvarlig for a skrive innkommende bytes til ringbufferet og oeke rx_head.
+; ==============================================================================
+serial_isr:
     push ax
     push bx
+    push cx
     push dx
+    push ds
 
-    ; Send til VGA via BIOS teletype INT 10h (AH=0Eh)
-    mov ah, 0x0E
-    mov bh, 0x00
-    mov bl, [term_color]
-    int 0x10
+    mov byte [cs:serial_active], 1
 
+    mov ax, 0x2000
+    mov ds, ax
+
+.drain_loop:
+    ; Sjekk Line Status Register (LSR, Port 0x3FD)
+    mov dx, 0x3FD
+    in al, dx
+    test al, 0x01               ; Data Ready?
+    jz .check_pending
+
+    ; Les tegn fra UART RBR (Port 0x3F8)
+    mov dx, 0x3F8
+    in al, dx
+
+    ; Beregn next_head = (rx_head + 1) & 0x7FFF
+    mov bx, [cs:rx_head]
+    mov cx, bx
+    inc cx
+    and cx, 0x7FFF              ; 32 KB wrap
+
+    ; Sjekk om ringbufferet er fullt: next_head == rx_tail
+    cmp cx, [cs:rx_tail]
+    je .buffer_overflow         ; Ikke overskriv unlest data hvis fullt!
+
+    ; Skriv tegn til 0x2000:bx
+    mov [bx], al
+
+    ; Atomisk oppdatering av rx_head (synlig for Consumer)
+    mov [cs:rx_head], cx
+    jmp .drain_loop
+
+.buffer_overflow:
+    jmp .drain_loop
+
+.check_pending:
+    ; Les IIR (Port 0x3FA): Bit 0 = 0 hvis UART fremdeles har ventende avbrudd
+    mov dx, 0x3FA
+    in al, dx
+    test al, 0x01
+    jz .drain_loop
+
+.isr_done:
+    ; Send EOI (End of Interrupt) til Master PIC (Port 0x20)
+    mov al, 0x20
+    out 0x20, al
+
+    pop ds
     pop dx
+    pop cx
     pop bx
     pop ax
+    iret
+
+; ==============================================================================
+; Terminal Output (Direkte til COM1 og VGA - 100% uavhengig av SeaBIOS sercon)
+; ==============================================================================
+serial_putc:
+    push dx
+    push ax
+    mov dx, 0x3FD
+.wait_tx:
+    in al, dx
+    test al, 0x20               ; THRE (Transmitter Holding Register Empty)?
+    jz .wait_tx
+    mov dx, 0x3F8
+    pop ax
+    push ax
+    out dx, al
+    pop ax
+    pop dx
+    ret
+
+vga_putc:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+
+    ; Hent markorposisjon fra BDA (0x0040:0x0050)
+    mov dx, 0x0040
+    mov ds, dx
+    mov dl, [0x0050]            ; DL = kolonne (0..79)
+    mov dh, [0x0051]            ; DH = rad (0..24)
+
+    mov bx, 0xB800
+    mov es, bx
+
+    cmp al, 13                  ; CR
+    je .cr
+    cmp al, 10                  ; LF
+    je .lf
+    cmp al, 8                   ; Backspace
+    je .bs
+
+    ; Skriv tegn med farge direkte til VGA tekstminne (0xB800)
+    movzx ax, dh
+    imul ax, ax, 160
+    movzx bx, dl
+    shl bx, 1
+    add bx, ax
+
+    mov ah, [cs:term_color]
+    mov [es:bx], ax
+
+    inc dl
+    cmp dl, 80
+    jb .update_pos
+    xor dl, dl
+    inc dh
+    jmp .chk_scroll
+
+.cr:
+    xor dl, dl
+    jmp .update_pos
+
+.lf:
+    inc dh
+
+.chk_scroll:
+    cmp dh, 25
+    jb .update_pos
+
+    ; Skroll opp 1 linje (24 linjer kopieres)
+    push ds
+    mov ax, 0xB800
+    mov ds, ax
+    mov es, ax
+    xor di, di
+    mov si, 160
+    mov cx, 1920
+    rep movsw
+
+    ; Blank ut linje 24
+    mov ax, 0x0720
+    mov cx, 80
+    rep stosw
+    pop ds
+
+    mov dh, 24
+    jmp .update_pos
+
+.bs:
+    test dl, dl
+    jz .update_pos
+    dec dl
+    movzx ax, dh
+    imul ax, ax, 160
+    movzx bx, dl
+    shl bx, 1
+    add bx, ax
+    mov word [es:bx], 0x0720
+
+.update_pos:
+    mov ax, 0x0040
+    mov ds, ax
+    mov [0x0050], dl
+    mov [0x0051], dh
+
+    ; Oppdater maskinvaremarkor
+    movzx ax, dh
+    imul ax, ax, 80
+    movzx bx, dl
+    add bx, ax
+
+    mov dx, 0x3D4
+    mov al, 0x0E
+    out dx, al
+    inc dx
+    mov al, bh
+    out dx, al
+
+    dec dx
+    mov al, 0x0F
+    out dx, al
+    inc dx
+    mov al, bl
+    out dx, al
+
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+term_putc:
+    call vga_putc
+    call serial_putc
     ret
 
 term_puts:
@@ -198,36 +448,53 @@ term_clear:
     pop ax
     ret
 
+; ==============================================================================
+; SPSC Lock-Free Ringbuffer: CONSUMER (Reader)
+; Kjoeres i hovedtraaden. Eneansvarlig for a lese fra ringbufferet og oeke rx_tail.
+; ==============================================================================
 term_getc:
-    push dx
+    push bx
 .poll_loop:
-    ; 1. Sjekk om det finnes tegn i tastaturbufferen via BIOS INT 16h (AH=01h)
+    ; 1. Sjekk om det finnes tegn i ringbufferet (rx_tail != rx_head)
+    mov bx, [rx_tail]
+    cmp bx, [rx_head]
+    jne .read_from_rx_buf
+
+    ; 2. Buffer er tomt. Hvis seriell sesjon er aktiv, vent utelukkende pa COM1!
+    ; IKKE roer BIOS INT 16h naar seriell er aktiv, da SeaBIOS sercon stjeler tegn!
+    cmp byte [serial_active], 1
+    je .poll_serial_wait
+
+    ; 3. Seriell er ikke aktiv (ren lokal VGA-skjerm): sjekk tastatur via BIOS INT 16h
     mov ah, 0x01
     int 0x16
     jnz .read_keyboard
 
-    ; 2. Sjekk om det finnes tegn i COM1 serial port (LSR bit 0)
-    mov dx, 0x3FD
-    in al, dx
-    test al, 0x01
-    jnz .read_serial
-
-    ; Vent en mikropause og prov igjen
+.poll_serial_wait:
+    pause
     jmp .poll_loop
+
+.read_from_rx_buf:
+    ; Les byte fra 0x2000:bx FOER tail oppdateres (beskytter data)
+    push ds
+    mov ax, 0x2000
+    mov ds, ax
+    mov al, [bx]
+    pop ds
+
+    ; Atomisk oppdatering av rx_tail (frigjor slotten for Producer)
+    inc bx
+    and bx, 0x7FFF
+    mov [rx_tail], bx
+    jmp .got_char
 
 .read_keyboard:
     mov ah, 0x00
-    int 0x16                    ; AL = ASCII, AH = Scan code
+    int 0x16                    ; AL = ASCII
     jmp .got_char
 
-.read_serial:
-    mov dx, 0x3F8
-    in al, dx                   ; Les fra COM1 Data Register
-
 .got_char:
-    ; Normaliser CR/LF og unngaa dobbel linjeskift ved 
-
-
+    ; Normaliser CR/LF og unngaa dobbel linjeskift ved CRLF
     cmp al, 10
     jne .chk_cr
     cmp byte [last_raw_char], 13
@@ -237,12 +504,12 @@ term_getc:
 .not_after_cr:
     mov byte [last_raw_char], 10
     mov al, 13
-    pop dx
+    pop bx
     ret
 
 .chk_cr:
     mov [last_raw_char], al
-    pop dx
+    pop bx
     ret
 
 ; ==============================================================================
@@ -328,6 +595,14 @@ dispatch_command:
     mov di, str_cmd_type
     call str_prefix
     je cmd_cat
+
+    ; del / rm <fil>
+    mov di, str_cmd_del
+    call str_prefix
+    je cmd_del
+    mov di, str_cmd_rm
+    call str_prefix
+    je cmd_del
 
     ; edit <fil>
     mov di, str_cmd_edit
@@ -644,25 +919,174 @@ cmd_cat:
     ret
 
 ; ==============================================================================
+; Slett fil fra filsystemet: del / rm <fil>
+; ==============================================================================
+cmd_del:
+    mov si, cmd_buffer
+.skip_cmd:
+    cmp byte [si], ' '
+    je .found_sp
+    cmp byte [si], 0
+    je .no_arg
+    inc si
+    jmp .skip_cmd
+.found_sp:
+    inc si
+    cmp byte [si], ' '
+    je .found_sp
+    cmp byte [si], 0
+    je .no_arg
+
+    ; SI peker na pa filnavnet som skal slettes
+    mov cx, [file_count]
+    xor bx, bx
+.search_loop:
+    push si
+    mov ax, bx
+    shl ax, 4
+    mov di, file_table
+    add di, ax
+    call str_equals
+    pop si
+    je .found_to_del
+    inc bx
+    loop .search_loop
+
+    mov si, msg_file_not_found
+    call term_puts
+    ret
+
+.no_arg:
+    mov si, msg_specify_file
+    call term_puts
+    ret
+
+.found_to_del:
+    ; BX = filindeks som skal slettes (0 .. file_count-1)
+    mov cx, [file_count]
+    dec cx                      ; siste indeks (file_count - 1)
+    cmp bx, cx
+    jae .last_entry
+
+    mov dx, cx
+    sub dx, bx
+
+.shift_loop:
+    push cx
+    push dx
+    mov di, file_table
+    mov ax, bx
+    shl ax, 4
+    add di, ax
+    mov si, di
+    add si, 16
+    mov cx, 16
+    rep movsb
+
+    mov di, file_ptrs
+    mov ax, bx
+    shl ax, 1
+    add di, ax
+    mov si, di
+    add si, 2
+    movsw
+
+    pop dx
+    pop cx
+    inc bx
+    dec dx
+    jnz .shift_loop
+
+.last_entry:
+    dec word [file_count]
+    mov bx, [file_count]
+
+    mov di, file_table
+    mov ax, bx
+    shl ax, 4
+    add di, ax
+    xor al, al
+    mov cx, 16
+    rep stosb
+
+    mov di, file_ptrs
+    mov ax, bx
+    shl ax, 1
+    add di, ax
+    xor ax, ax
+    stosw
+
+    mov si, msg_file_deleted
+    call term_puts
+    ret
+
+; ==============================================================================
 ; Innebygd Terminal-Editor: edit <fil>
 ; ==============================================================================
 cmd_edit:
     mov si, cmd_buffer + 4
-.sp:
+    xor bx, bx                  ; BL = force clear flag (1 = start helt tomt)
+
+.parse_opt:
     cmp byte [si], ' '
-    jne .arg
+    jne .chk_flag
     inc si
-    jmp .sp
+    jmp .parse_opt
+
+.chk_flag:
+    cmp byte [si], '-'
+    jne .arg
+    cmp byte [si+1], 'c'
+    je .set_flag
+    cmp byte [si+1], 'n'
+    je .set_flag
+    jmp .arg
+
+.set_flag:
+    mov bl, 1
+    add si, 2
+    jmp .parse_opt
+
 .arg:
     cmp byte [si], 0
     je .no_arg
 
     mov di, edit_filename
-    call copy_str
+.copy_fn:
+    lodsb
+    cmp al, ' '
+    je .fn_done
+    cmp al, 0
+    je .fn_done_end
+    stosb
+    jmp .copy_fn
 
+.fn_done:
+    mov byte [di], 0
+.skip_post_sp:
+    cmp byte [si], ' '
+    jne .chk_post_flag
+    inc si
+    jmp .skip_post_sp
+.chk_post_flag:
+    cmp byte [si], '-'
+    jne .after_fn
+    cmp byte [si+1], 'c'
+    je .set_post_flag
+    cmp byte [si+1], 'n'
+    jne .after_fn
+.set_post_flag:
+    mov bl, 1
+    jmp .after_fn
+
+.fn_done_end:
+    mov byte [di], 0
+
+.after_fn:
     mov word [edit_content_end], edit_content_buf
     mov byte [edit_content_buf], 0
     mov word [edit_cur_line], 1
+    mov byte [edit_cmd_mode], 0
 
     mov si, msg_edit_intro
     call term_puts
@@ -670,6 +1094,10 @@ cmd_edit:
     call term_puts
     mov si, msg_edit_menu
     call term_puts
+
+    ; Hvis force clear / new flagg er satt, start med tomt buffer
+    test bl, bl
+    jnz .new_file
 
     ; Sjekk om filen finnes
     mov si, edit_filename
@@ -707,13 +1135,18 @@ cmd_edit:
     call term_puts
 
 .edit_loop:
-    ; Vis linjenummer for linjen som skrives
+    mov bx, [rx_tail]
+    cmp bx, [rx_head]
+    jne .skip_prefix
     mov ax, [edit_cur_line]
     call print_line_num_prefix
+.skip_prefix:
 
     mov di, edit_line_buf
 .read_l:
     call term_getc
+    cmp al, 27                  ; ESC-tast: Slaa paa kommandomodus!
+    je .check_esc
     cmp al, 13
     je .line_done
     cmp al, 8
@@ -722,23 +1155,34 @@ cmd_edit:
     je .tab
     cmp al, 32
     jb .read_l
-    cmp di, edit_line_buf + 120
+    cmp di, edit_line_buf + 240
     jae .read_l
     stosb
+
+    ; Hvis det allerede ligger flere tegn i ringbufferet (innliming/burst),
+    ; hopp over tegn-ekko for lynrask mottakelse uten seriemetning eller tap!
+    mov bx, [rx_tail]
+    cmp bx, [rx_head]
+    jne .skip_echo
     call term_putc
+.skip_echo:
     jmp .read_l
 
 .tab:
     mov cx, 4
 .tab_sp:
-    cmp di, edit_line_buf + 120
+    cmp di, edit_line_buf + 240
     jae .read_l
     mov byte [di], ' '
     inc di
     push ax
     push cx
     mov al, ' '
+    mov bx, [rx_tail]
+    cmp bx, [rx_head]
+    jne .skip_tab_echo
     call term_putc
+.skip_tab_echo:
     pop cx
     pop ax
     loop .tab_sp
@@ -751,81 +1195,130 @@ cmd_edit:
     call term_backspace
     jmp .read_l
 
-.line_done:
+.check_esc:
+    ; Sjekk om det foelger en ANSI-sekvens for piltaster over COM1 (\x1b[A eller \x1b[B)
+    push cx
+    mov cx, 500
+.esc_wait_byte:
+    mov bx, [rx_tail]
+    cmp bx, [rx_head]
+    jne .esc_check_peek
+    mov ah, 0x01
+    int 0x16
+    jnz .esc_kbd_peek
+    loop .esc_wait_byte
+
+    ; Ingen tegn foelger umiddelbart -> ekte ESC-tast: gaa til kommandomodus!
+    pop cx
+    jmp .enter_cmd_mode
+
+.esc_check_peek:
+    ; Sniktitt paa neste tegn i ringbufferet uten aa fjerne det
+    push ds
+    mov ax, 0x2000
+    mov ds, ax
+    mov al, [bx]
+    pop ds
+    cmp al, '['
+    jne .esc_not_arrow          ; Ikke piltast -> det er en editor-kommando (f.eks. wq eller c)
+    ; Det er '[' -> konsumer '[' og les retningskode
+    call term_getc              ; les '['
+    call term_getc              ; les 'A' eller 'B'
+    pop cx
+    cmp al, 'A'                 ; Pil opp
+    je .go_up
+    cmp al, 'B'                 ; Pil ned
+    je .go_down
+    jmp .read_l
+
+.esc_kbd_peek:
+    pop cx
+    jmp .enter_cmd_mode
+
+.esc_not_arrow:
+    pop cx
+    jmp .enter_cmd_mode
+
+; ------------------------------------------------------------------------------
+; Kommandomodus: Slaas paa med ESC, og slaas automatisk av igjen etter en kommando!
+; ------------------------------------------------------------------------------
+.enter_cmd_mode:
+    mov byte [edit_cmd_mode], 1
+    call term_crlf
+    mov si, msg_edit_cmd_prompt ; '[Kommando] : '
+    call term_puts
+
+    mov di, edit_cmd_buf
+.cmd_read_l:
+    call term_getc
+    cmp al, 27                  ; ESC trykket igjen -> slaa av kommandomodus
+    je .cancel_cmd_mode
+    cmp al, 13                  ; Enter -> utfoer kommando
+    je .cmd_line_done
+    cmp al, 8                   ; Backspace
+    je .cmd_bs
+    cmp al, 32
+    jb .cmd_read_l
+    cmp di, edit_cmd_buf + 60
+    jae .cmd_read_l
+    stosb
+    call term_putc
+    jmp .cmd_read_l
+
+.cmd_bs:
+    cmp di, edit_cmd_buf
+    jbe .cmd_read_l
+    dec di
+    call term_backspace
+    jmp .cmd_read_l
+
+.cancel_cmd_mode:
+    mov byte [edit_cmd_mode], 0
+    mov si, msg_edit_cmd_cancel ; ' [Avbrutt - redigering aktiv]', 13, 10, 0
+    call term_puts
+    jmp .edit_loop
+
+.cmd_line_done:
     mov byte [di], 0
     call term_crlf
 
-    ; Sjekk editor-kommandoer
-    mov si, edit_line_buf
-.skip_sp:
+    ; Kommandomodus slaas umiddelbart av saa fort en kommando er lagt inn!
+    mov byte [edit_cmd_mode], 0
+
+    ; Parse kommando fra edit_cmd_buf
+    mov si, edit_cmd_buf
+.skip_cmd_sp:
     cmp byte [si], ' '
-    jne .chk_cmd
+    jne .chk_cmd_prefix
     inc si
-    jmp .skip_sp
+    jmp .skip_cmd_sp
 
-.chk_cmd:
-    cmp byte [si], ':'
-    je .handle_colon_cmd
-
-    ; Normal tekst (eller trykk pa Enter)
+.chk_cmd_prefix:
+    ; Hvis tom linje (bare Enter), gaa direkte tilbake til redigeringsmodus
     cmp byte [si], 0
-    je .handle_empty_enter
+    je .edit_loop
 
-    ; Brukeren skrev inn tekst: hvis edit_cur_line <= totalt antall linjer, erstatt!
-    call count_file_lines
-    mov cx, ax
-    mov ax, [edit_cur_line]
-    cmp ax, cx
-    ja .append_new_line
+    ; Hvis brukeren skrev ':' (f.eks. ':w' eller ':q'), hopp over ':'
+    cmp byte [si], ':'
+    jne .skip_colon_sp
+    inc si
 
-    ; Erstatt eksisterende linje AX
-    mov dx, edit_line_buf
-    call replace_line
-    mov si, msg_edit_replaced
-    call term_puts
-    inc word [edit_cur_line]
-    call show_selected_line
-    jmp .edit_loop
+.skip_colon_sp:
+    cmp byte [si], ' '
+    jne .chk_cmds
+    inc si
+    jmp .skip_colon_sp
 
-.handle_empty_enter:
-    ; Enter trykket uten tekst: hvis vi er pa en eksisterende linje, gaa bare videre ned
-    call count_file_lines
-    mov cx, ax
-    mov ax, [edit_cur_line]
-    cmp ax, cx
-    ja .append_new_line
+.chk_cmds:
+    cmp byte [si], 0
+    je .edit_loop
 
-    ; Gaa bare til neste linje uten aa overskrive
-    inc word [edit_cur_line]
-    call show_selected_line
-    jmp .edit_loop
-
-.append_new_line:
-    mov si, edit_line_buf
-    mov di, [edit_content_end]
-.append_loop:
-    cmp di, edit_content_buf + 3800
-    jae .append_done
-    lodsb
-    stosb
-    test al, al
-    jnz .append_loop
-    dec di
-    mov byte [di], 13
-    inc di
-    mov byte [di], 10
-    inc di
-    mov byte [di], 0
-    mov [edit_content_end], di
-    inc word [edit_cur_line]
-.append_done:
-    jmp .edit_loop
-
-.handle_colon_cmd:
-    inc si                      ; hopp over ':'
+    ; :c eller :clear (toem buffer for aa starte paa nytt paa linje 1)
+    cmp byte [si], 'c'
+    je .clear_buffer
 
     ; :wq
-    cmp word [si], 0x7177       ; "wq"
+    cmp word [si], 0x7177       ; 'wq'
     je .save_and_quit
 
     ; :w
@@ -845,7 +1338,7 @@ cmd_edit:
     je .go_up
 
     ; Sjekk :dn eller :down (gaa ned)
-    cmp word [si], 0x6E64       ; "dn"
+    cmp word [si], 0x6E64       ; 'dn'
     je .go_down
     cmp byte [si], 'd'
     jne .chk_g
@@ -864,13 +1357,86 @@ cmd_edit:
     cmp byte [si], 'r'
     je .do_replace
 
-    ; Sjekk om forste tegn er et tall '0'..'9': hurtigkommando :<nr> eller :<nr> <tekst>
+    ; help eller ?
+    cmp byte [si], 'h'
+    je .show_edit_help
+    cmp byte [si], '?'
+    je .show_edit_help
+
+    ; Sjekk om foerste tegn er et tall '0'..'9': hurtigkommando :<nr> eller :<nr> <tekst>
     cmp byte [si], '0'
     jb .cmd_unknown
     cmp byte [si], '9'
     jbe .do_shorthand_replace
 
 .cmd_unknown:
+    mov si, msg_edit_unknown_cmd
+    call term_puts
+    jmp .edit_loop
+
+.show_edit_help:
+    mov si, msg_edit_menu
+    call term_puts
+    jmp .edit_loop
+
+; ------------------------------------------------------------------------------
+; Redigeringsmodus (Tekst): Alle linjer som skrives eller pastes lagres her.
+; INGEN linjer tolkes som kommandoer! Kolon ':' oppfattes som ren tekst.
+; ------------------------------------------------------------------------------
+.line_done:
+    mov byte [di], 0
+    mov bx, [rx_tail]
+    cmp bx, [rx_head]
+    jne .skip_ld_crlf
+    call term_crlf
+.skip_ld_crlf:
+
+    ; Sjekk om vi skal erstatte en eksisterende linje eller appende ny linje
+    call count_file_lines
+    mov cx, ax
+    mov ax, [edit_cur_line]
+    cmp ax, cx
+    ja .append_new_line
+
+    ; Vi er paa en eksisterende linje (edit_cur_line <= count_file_lines):
+    ; Hvis brukeren trykket Enter uten tekst, gaa bare videre til neste linje
+    cmp byte [edit_line_buf], 0
+    je .next_existing_line
+
+    ; Erstatt eksisterende linje AX med innholdet i edit_line_buf (uten statusmelding under innliming)
+    mov dx, edit_line_buf
+    call replace_line
+    inc word [edit_cur_line]
+    jmp .edit_loop
+
+.next_existing_line:
+    inc word [edit_cur_line]
+    jmp .edit_loop
+
+.append_new_line:
+    ; Append linje (ogsaa blanke linjer) direkte i bufferet
+    mov si, edit_line_buf
+    mov di, [edit_content_end]
+.append_loop:
+    cmp di, edit_content_buf + 14000
+    jae .append_full
+    lodsb
+    stosb
+    test al, al
+    jnz .append_loop
+    dec di
+    mov byte [di], 13
+    inc di
+    mov byte [di], 10
+    inc di
+    mov byte [di], 0
+    mov [edit_content_end], di
+    inc word [edit_cur_line]
+    jmp .edit_loop
+
+.append_full:
+    mov si, msg_edit_buf_full
+    call term_puts
     jmp .edit_loop
 
 .go_up:
@@ -969,6 +1535,14 @@ cmd_edit:
     call term_puts
     jmp .quit_edit
 
+.clear_buffer:
+    mov word [edit_content_end], edit_content_buf
+    mov byte [edit_content_buf], 0
+    mov word [edit_cur_line], 1
+    mov si, msg_edit_cleared
+    call term_puts
+    jmp .edit_loop
+
 .save_file:
     mov si, edit_filename
     mov bx, edit_content_buf
@@ -981,7 +1555,6 @@ cmd_edit:
     mov si, msg_edit_quit
     call term_puts
     ret
-
 .no_arg:
     mov si, msg_specify_file
     call term_puts
@@ -1200,12 +1773,16 @@ replace_line:                   ; AX = linjenr, DX = ny tekst (nullterminert)
     push si
     push dx
 
-    ; 1. Kopier suffix fra DI til 0xC000
+    ; 1. Kopier suffix fra DI til 0x2000:8000 (ES:BX, trygt adskilt fra rx_buf 0x0000..0x7FFF)
+    push es
+    mov ax, 0x2000
+    mov es, ax
+    mov bx, 0x8000
     mov si, di
-    mov di, 0xC000
 .copy_suf:
     lodsb
-    stosb
+    mov [es:bx], al
+    inc bx
     test al, al
     jnz .copy_suf
 
@@ -1225,13 +1802,15 @@ replace_line:                   ; AX = linjenr, DX = ny tekst (nullterminert)
     mov byte [di], 10
     inc di
 
-    ; 3. Kopier suffix tilbake fra 0xC000
-    mov si, 0xC000
+    ; 3. Kopier suffix tilbake fra 0x2000:8000
+    mov bx, 0x8000
 .copy_back:
-    lodsb
+    mov al, [es:bx]
+    inc bx
     stosb
     test al, al
     jnz .copy_back
+    pop es
 
     dec di
     mov [edit_content_end], di
@@ -1632,14 +2211,14 @@ save_to_fs:
 
 .copy_data:
     ; ax = slot indeks
-    ; Beregn fast bufferadresse i FS_POOL: 0x9800 + (ax - 8) * 512
+    ; Beregn fast bufferadresse i FS_POOL: 0xB800 + (ax - 9) * 4096
     mov dx, ax
-    sub dx, 8
+    sub dx, 9
     jns .u_slot_ok
     xor dx, dx
 .u_slot_ok:
-    shl dx, 9
-    add dx, 0x9800              ; dx = dest i FS_POOL
+    shl dx, 12                 ; dx * 4096 (4 KB per fil)
+    add dx, 0xB800              ; dx = dest i FS_POOL (0xB800..0xF000)
 
     ; Kopier innhold fra BP (edit_content_buf) til DX
     mov di, dx
@@ -1812,7 +2391,8 @@ msg_help:
     db "  help / ?          : Viser denne hjelpeteksten", 13, 10
     db "  dir / ls          : Viser filer i operativsystemets filsystem", 13, 10
     db "  cat / type <fil>  : Skriver ut innholdet i en kildekodefil", 13, 10
-    db "  edit <fil>        : Interaktiv tekst-editor i terminalen", 13, 10
+    db "  edit [-c] <fil>   : Interaktiv tekst-editor (-c toemmer for ny kode)", 13, 10
+    db "  del / rm <fil>    : Sletter en fil fra filsystemet", 13, 10
     db "  cc <fil>          : Kompilerer C-fil med innebygd x86-kompilator", 13, 10
     db "  run <fil>         : Kompilerer og kjorer C-programmet i OS-et", 13, 10
     db "  asm <fil>         : Viser den genererte x86 assembly-maskinkoden", 13, 10
@@ -1841,8 +2421,11 @@ msg_mem:
     db "  0x0000:0x0000 - 0x0000:0x03FF : BIOS Interrupt Vector Table (IVT)", 13, 10
     db "  0x0000:0x0400 - 0x0000:0x04FF : BIOS Data Area (BDA)", 13, 10
     db "  0x0000:0x7C00 - 0x0000:0x7DFF : CustomC-OS MSB (Master Boot Sector)", 13, 10
-    db "  0x1000:0x0000 - 0x1000:0x7FFF : CustomC-OS Kjerne & Terminalkode (32 KB)", 13, 10
-    db "  0x1000:0x8000 - 0x1000:0xFFFE : Stakk, Kompilatorbuffere & Filsystem", 13, 10
+    db "  0x1000:0x0000 - 0x1000:0x5DFF : CustomC-OS Kjerne & Terminalkode", 13, 10
+    db "  0x1000:0x5E00 - 0x1000:0x95FF : Editor-buffer (14 KB)", 13, 10
+    db "  0x1000:0x9600 - 0x1000:0xADFF : C-Kompilator (Variabler, Funksjoner, Heap)", 13, 10
+    db "  0x1000:0xAE00 - 0x1000:0xEFFF : Filsystem / Workspace pool (16.5 KB)", 13, 10
+    db "  0x1000:0xF000 - 0x1000:0xFFFE : Systemstakk (4 KB)", 13, 10
     db "  0xB800:0x0000 - 0xB800:0x7FFF : VGA Fargetekst videominne", 13, 10, 13, 10, 0
 
 msg_dir_header:
@@ -1874,24 +2457,36 @@ err_unknown_cmd_tail:   db "' ble ikke gjenkjent. Skriv 'help' for tilgjengelige
 
 msg_edit_intro:         db 13, 10, "=== CustomC-OS Terminal Editor: ", 0
 msg_edit_menu:          db " ===", 13, 10
-                        db "Kommandoer:", 13, 10
-                        db "  :w                 = Lagre til filsystemet (:wq for a lagre og avslutte)", 13, 10
-                        db "  :q                 = Avslutt editor uten a lagre", 13, 10
-                        db "  :l                 = List alle linjer med linjenumre", 13, 10
-                        db "  :r <linje> <tekst> = Erstatt linje (f.eks: :r 2 char s2[8];)", 13, 10
-                        db "  :<linje> <tekst>   = Hurtigerstatt linje (f.eks: :2 char s2[8];)", 13, 10
-                        db "  :d <linje>         = Slett linje (eller :d for gjeldende linje)", 13, 10
-                        db "  :u                 = Gaa opp en linje", 13, 10
-                        db "  :dn                = Gaa ned en linje (eller trykk Enter)", 13, 10
-                        db "  :g <linje>         = Gaa til linje (f.eks: :g 2 eller :2)", 13, 10
+                        db "Skriv inn eller lim inn kode/tekst direkte i redigeringsmodus.", 13, 10
+                        db "Kommandomodus slaas paa med [ESC] (slaas av etter utfoert kommando):", 13, 10
+                        db "  [ESC] -> c                 = Tom buffer (start pa nytt pa linje 1)", 13, 10
+                        db "  [ESC] -> w                 = Lagre til filsystemet", 13, 10
+                        db "  [ESC] -> wq                = Lagre og avslutt editor", 13, 10
+                        db "  [ESC] -> q                 = Avslutt editor uten aa lagre", 13, 10
+                        db "  [ESC] -> l                 = List alle linjer med linjenumre", 13, 10
+                        db "  [ESC] -> r <linje> <tekst> = Erstatt linje (f.eks: r 2 char s[8];)", 13, 10
+                        db "  [ESC] -> <linje> <tekst>   = Hurtigerstatt linje (f.eks: 2 char s[8];)", 13, 10
+                        db "  [ESC] -> d <linje>         = Slett linje (eller d for gjeldende linje)", 13, 10
+                        db "  [ESC] -> u                 = Gaa opp en linje", 13, 10
+                        db "  [ESC] -> dn                = Gaa ned en linje", 13, 10
+                        db "  [ESC] -> g <linje>         = Gaa til linje (f.eks: g 5 eller bare 5)", 13, 10
+                        db "  [ESC] -> ESC               = Avbryt kommando og gaa tilbake til skriving", 13, 10
                         db "----------------------------------------------------", 13, 10, 0
-msg_edit_existing:      db "[Eksisterende innhold]:", 13, 10, 0
-msg_edit_prompt:        db "[Redigeringsmodus aktiv]:", 13, 10, 0
+msg_edit_existing:      db "[Eksisterende innhold - trykk ESC og 'c' for aa toemme bufferet]:", 13, 10, 0
+msg_edit_prompt:        db "[Redigeringsmodus aktiv - lim inn eller skriv under (ESC for kommando)]:", 13, 10, 0
+msg_edit_cmd_prompt:    db "[Kommando] : ", 0
+msg_edit_cmd_cancel:    db " [Avbrutt - redigering aktiv]", 13, 10, 0
+msg_edit_unknown_cmd:   db "[!] Ukjent kommando. Trykk ESC for kommandoer (w, q, wq, l, d, r, g).", 13, 10, 0
+msg_edit_buf_full:      db 13, 10, "[!] Editor-buffer er full (maks 14 KB)!", 13, 10, 0
 str_edit_sp2:           db "  ", 0
 str_edit_sp1:           db " ", 0
 str_edit_bar:           db " | ", 0
 msg_file_saved:         db "[+] Filen ble lagret i filsystemet!", 13, 10, 0
 msg_edit_quit:          db "[*] Avsluttet editor.", 13, 10, 0
+msg_edit_cleared:       db "[*] Buffer tomt. Klar for ny kode (linje 1).", 13, 10, 0
+msg_file_deleted:       db "[*] Fil slettet fra filsystemet.", 13, 10, 0
+str_cmd_del:            db "del", 0
+str_cmd_rm:             db "rm", 0
 msg_edit_replaced:      db "[+] Linje erstattet!", 13, 10, 0
 msg_edit_deleted:       db "[+] Linje slettet!", 13, 10, 0
 msg_edit_invalid_ln:    db "[!] Ugyldig linjenummer!", 13, 10, 0
@@ -2220,8 +2815,18 @@ file_ptrs               times 24  dw 0    ; Pekere til innhold
 cmd_buffer              times 128 db 0
 compile_target_fname    times 32  db 0
 edit_filename           times 32  db 0
-edit_line_buf           times 128 db 0
+edit_line_buf           times 256 db 0
+edit_cmd_buf            times 64  db 0
 edit_content_end        dw 0
 edit_cur_line           dw 1
+edit_cmd_mode           db 0
 last_raw_char           db 0
-edit_content_buf        times 4096 db 0
+
+align 4
+rx_head                 dw 0
+rx_tail                 dw 0
+serial_active           db 0
+
+align 16
+; Editor-buffer (14 KB) starter direkte etter alle variabler
+edit_content_buf:

@@ -125,16 +125,18 @@ Kjores direkte i CustomC-OS terminalen.
 
 CustomC-OS:\> edit min_fil.c
 === CustomC-OS Terminal Editor: min_fil.c ===
-Skriv inn tekst direkte i terminalen.
-Kommandoer:
-  :w  = Lagre til filsystemet
-  :q  = Avslutt editor og gaa tilbake til skallet
+Skriv inn eller lim inn kode/tekst direkte i redigeringsmodus.
+Kommandomodus slaas paa med [ESC] (slaas av etter utfoert kommando):
+  [ESC] -> w   = Lagre til filsystemet
+  [ESC] -> wq  = Lagre og avslutt editor
+  [ESC] -> q   = Avslutt editor uten aa lagre
 ----------------------------------------------------
-[Redigeringsmodus aktiv - start a skrive under]:
-> int main() { return 123; }
-> :w
+[Redigeringsmodus aktiv - lim inn eller skriv under (ESC for kommando)]:
+  1 | int main() {
+  2 |     return 123;
+  3 | }
+[Kommando] : wq
 [+] Filen ble lagret i filsystemet!
-> :q
 [*] Avsluttet editor.
 
 CustomC-OS:\> run min_fil.c

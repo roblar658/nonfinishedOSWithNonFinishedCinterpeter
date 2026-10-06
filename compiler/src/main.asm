@@ -86,6 +86,11 @@ kw_switch               db "switch", 0
 kw_case                 db "case", 0
 kw_default              db "default", 0
 kw_extern               db "extern", 0
+kw_long                 db "long", 0
+kw_const                db "const", 0
+kw_static               db "static", 0
+kw_unsigned             db "unsigned", 0
+kw_signed               db "signed", 0
 kw_define               db "define", 0
 
 ; Code generator templates

@@ -579,8 +579,48 @@ lex_ident_or_keyword:
     lea rdx, [rel kw_extern]
     call str_cmp
     test eax, eax
-    jnz .not_kw
+    jnz .k17
     mov qword [rel tok_type], TOK_EXTERN
+    ret
+.k17:
+    lea rcx, [rel tok_str]
+    lea rdx, [rel kw_long]
+    call str_cmp
+    test eax, eax
+    jnz .k18
+    mov qword [rel tok_type], TOK_LONG
+    ret
+.k18:
+    lea rcx, [rel tok_str]
+    lea rdx, [rel kw_const]
+    call str_cmp
+    test eax, eax
+    jnz .k19
+    mov qword [rel tok_type], TOK_CONST
+    ret
+.k19:
+    lea rcx, [rel tok_str]
+    lea rdx, [rel kw_static]
+    call str_cmp
+    test eax, eax
+    jnz .k20
+    mov qword [rel tok_type], TOK_STATIC
+    ret
+.k20:
+    lea rcx, [rel tok_str]
+    lea rdx, [rel kw_unsigned]
+    call str_cmp
+    test eax, eax
+    jnz .k21
+    mov qword [rel tok_type], TOK_UNSIGNED
+    ret
+.k21:
+    lea rcx, [rel tok_str]
+    lea rdx, [rel kw_signed]
+    call str_cmp
+    test eax, eax
+    jnz .not_kw
+    mov qword [rel tok_type], TOK_SIGNED
     ret
 .not_kw:
     mov qword [rel tok_type], TOK_IDENT

@@ -25,6 +25,7 @@ T_SUBEQ     equ 137
 T_MULEQ     equ 138
 T_DIVEQ     equ 139
 T_MODEQ     equ 140
+T_ARROW     equ 141
 K_INT       equ 150
 K_CHAR      equ 151
 K_VOID      equ 152
@@ -58,17 +59,17 @@ K_ENUM      equ 177
 K_TYPEDEF   equ 178
 
 ; Minnekart for tolken (offset i kjernesegmentet 0x1000)
-CI_VARS         equ 0x8000      ; variabeltabell
+CI_VARS         equ 0xA000      ; variabeltabell (3 KB: 0xA000..0xAC00)
 CI_VAR_SIZE     equ 24          ; navn[16], verdi dd, arr_ptr dw, arr_len dw
 CI_MAX_VARS     equ 128
-CI_FUNCS        equ 0x8C00      ; funksjonstabell
+CI_FUNCS        equ 0xAC00      ; funksjonstabell (1 KB: 0xAC00..0xB000)
 CI_FUNC_SIZE    equ 20          ; navn[16], posisjon dw, pad dw
 CI_MAX_FUNCS    equ 32
-CI_HEAP         equ 0x9000      ; array-minne
-CI_HEAP_END     equ 0x9800
-FS_POOL         equ 0x9800      ; lagrede filer fra editoren
-FS_POOL_END     equ 0xB000
-CI_STACK_MIN    equ 0xB400      ; stakkgrense (rekursjonsvern)
+CI_HEAP         equ 0xB000      ; array-minne (2 KB: 0xB000..0xB800)
+CI_HEAP_END     equ 0xB800
+FS_POOL         equ 0xB800      ; lagrede filer fra editoren (14 KB: 0xB800..0xF000)
+FS_POOL_END     equ 0xF000
+CI_STACK_MIN    equ 0xF000      ; stakkgrense (rekursjonsvern, 4 KB stakk 0xF000..0xFFFE)
 
 %macro EXPECT 1
     cmp byte [tok_type], %1
@@ -336,6 +337,21 @@ ci_lex:
 .num_end:
     cmp byte [si], '.'
     je .read_float
+.skip_suffix:
+    mov bl, [si]
+    cmp bl, 'u'
+    je .inc_suffix
+    cmp bl, 'U'
+    je .inc_suffix
+    cmp bl, 'l'
+    je .inc_suffix
+    cmp bl, 'L'
+    je .inc_suffix
+    jmp .suffix_done
+.inc_suffix:
+    inc si
+    jmp .skip_suffix
+.suffix_done:
     mov [tok_num], eax
     mov byte [tok_type], T_NUM
     jmp .done
@@ -713,7 +729,15 @@ ci_consume_type:
     jmp .skip_ptrs
 .u_eat:
     call ci_lex
+.u_eat_loop:
+    cmp byte [tok_type], K_LONG
+    je .u_eat_extra
+    cmp byte [tok_type], K_INT
+    je .u_eat_extra
     jmp .skip_ptrs
+.u_eat_extra:
+    call ci_lex
+    jmp .u_eat_loop
 
 .check_basic:
     cmp al, K_INT
@@ -843,6 +867,7 @@ ci_consume_type:
 .is_int:
     mov dl, K_INT
     call ci_lex
+.eat_int_loop:
     cmp byte [tok_type], K_INT
     je .eat_extra
     cmp byte [tok_type], K_LONG
@@ -850,6 +875,7 @@ ci_consume_type:
     jmp .skip_ptrs
 .eat_extra:
     call ci_lex
+    jmp .eat_int_loop
 .skip_ptrs:
     xor dh, dh
 .sp_loop:
@@ -2272,7 +2298,8 @@ ci_primary:
     call ci_expr
     EXPECT ')'
     mov word [ci_lv], 0
-    ret
+    mov di, ci_dummy
+    jmp .postfix_loop
 
 .is_cast:
     call ci_consume_type
@@ -2319,35 +2346,129 @@ ci_primary:
     mov si, sp
     call ci_var_ref
     add sp, 16
-    mov bl, [tok_type]
-    cmp bl, T_INC
-    je .post
-    cmp bl, T_DEC
-    je .post
-    mov [ci_lv], di
-    ret
-.post:
-    call ci_lex
-    mov ecx, eax
-    cmp bl, T_INC
-    jne .pd
-    inc ecx
-    jmp .ps
-.pd:
-    dec ecx
-.ps:
-    cmp byte [ci_exec], 0
-    je .pn
-    mov [di], ecx
-.pn:
-    mov word [ci_lv], 0
-    ret
+    jmp .postfix_loop
 .call:
     mov si, sp
     call ci_call
     add sp, 16
     mov word [ci_lv], 0
+    mov di, ci_dummy
+    jmp .postfix_loop
+
+.postfix_loop:
+    mov bl, [tok_type]
+    cmp bl, '.'
+    je .post_dot
+    cmp bl, T_ARROW
+    je .post_arrow
+    cmp bl, '['
+    je .post_index
+    cmp bl, T_INC
+    je .post_inc
+    cmp bl, T_DEC
+    je .post_dec
+    mov [ci_lv], di
     ret
+
+.post_dot:
+    call ci_lex                 ; spis '.'
+    cmp byte [tok_type], T_IDENT
+    jne .err_name
+    call ci_lex                 ; spis medlemsnavn
+    cmp byte [ci_exec], 0
+    jne .post_dot_live
+    mov di, ci_dummy
+    xor eax, eax
+    jmp .postfix_loop
+.post_dot_live:
+    test di, di
+    jnz .post_dot_ok
+    mov di, ci_dummy
+    xor eax, eax
+    jmp .postfix_loop
+.post_dot_ok:
+    mov eax, [di]
+    jmp .postfix_loop
+
+.post_arrow:
+    call ci_lex                 ; spis '->'
+    cmp byte [tok_type], T_IDENT
+    jne .err_name
+    call ci_lex                 ; spis medlemsnavn
+    cmp byte [ci_exec], 0
+    jne .post_arrow_live
+    mov di, ci_dummy
+    xor eax, eax
+    jmp .postfix_loop
+.post_arrow_live:
+    test eax, eax
+    jz .post_arrow_null
+    mov di, ax
+    mov eax, [di]
+    jmp .postfix_loop
+.post_arrow_null:
+    mov di, ci_dummy
+    xor eax, eax
+    jmp .postfix_loop
+
+.post_index:
+    push di
+    push eax
+    call ci_lex                 ; spis '['
+    call ci_expr
+    EXPECT ']'
+    pop edx
+    pop di
+    cmp byte [ci_exec], 0
+    jne .post_idx_live
+    mov di, ci_dummy
+    xor eax, eax
+    jmp .postfix_loop
+.post_idx_live:
+    test edx, edx
+    jz .post_idx_use_di
+    mov di, dx
+.post_idx_use_di:
+    test di, di
+    jz .post_idx_null
+    shl ax, 2
+    add di, ax
+    mov eax, [di]
+    jmp .postfix_loop
+.post_idx_null:
+    mov di, ci_dummy
+    xor eax, eax
+    jmp .postfix_loop
+
+.post_inc:
+    call ci_lex
+    mov ecx, eax
+    inc ecx
+    cmp byte [ci_exec], 0
+    je .pn_inc
+    test di, di
+    jz .pn_inc
+    mov [di], ecx
+.pn_inc:
+    mov word [ci_lv], 0
+    ret
+
+.post_dec:
+    call ci_lex
+    mov ecx, eax
+    dec ecx
+    cmp byte [ci_exec], 0
+    je .pn_dec
+    test di, di
+    jz .pn_dec
+    mov [di], ecx
+.pn_dec:
+    mov word [ci_lv], 0
+    ret
+
+.err_name:
+    mov si, ci_e_name
+    jmp ci_error
 .err:
     cmp bl, T_EOF
     je .eof
@@ -2585,17 +2706,16 @@ ci_call:
     je .p_as_struct
     cmp al, K_ENUM
     je .p_as_struct
+    cmp al, T_IDENT
+    je .p_as_typedef
     jmp .p_std
+.p_as_typedef:
+    call ci_lex
+    mov al, K_INT
+    mov [ci_cur_decl_type], al
+    jmp .p_after_eat
 .p_as_int:
     mov al, K_INT
-    jmp .ptype
-.p_as_struct:
-    call ci_lex
-    cmp byte [tok_type], T_IDENT
-    jne .err_param
-    call ci_lex
-    mov al, K_INT
-    jmp .ptype
 .p_std:
     mov [ci_cur_decl_type], al
     cmp al, K_INT
@@ -2609,8 +2729,25 @@ ci_call:
     cmp al, K_VOID
     je .ptype
     jne .err_param
+.p_as_struct:
+    call ci_lex
+    cmp byte [tok_type], T_IDENT
+    jne .err_param
+    call ci_lex
+    mov al, K_INT
+    mov [ci_cur_decl_type], al
+    jmp .p_after_eat
 .ptype:
     call ci_lex
+.p_eat_extra:
+    cmp byte [tok_type], K_LONG
+    je .p_do_eat
+    cmp byte [tok_type], K_INT
+    jne .p_after_eat
+.p_do_eat:
+    call ci_lex
+    jmp .p_eat_extra
+.p_after_eat:
     cmp byte [tok_type], '('
     jne .pnot_fnp
     call ci_lex
@@ -2638,9 +2775,11 @@ ci_call:
     call ci_lex
     jmp .param_loop
 .pnot_fnp:
+.pnot_ptr_loop:
     cmp byte [tok_type], '*'
     jne .pnot_ptr
     call ci_lex
+    jmp .pnot_ptr_loop
 .pnot_ptr:
     cmp byte [tok_type], T_IDENT
     jne .err_param
@@ -3332,6 +3471,7 @@ ci_ops2:
     db '|', '|', T_OR
     db '+', '+', T_INC
     db '-', '-', T_DEC
+    db '-', '>', T_ARROW
     db '+', '=', T_ADDEQ
     db '-', '=', T_SUBEQ
     db '*', '=', T_MULEQ

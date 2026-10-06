@@ -33,6 +33,11 @@ TOK_SWITCH      equ 269
 TOK_CASE        equ 270
 TOK_DEFAULT     equ 271
 TOK_EXTERN      equ 272
+TOK_LONG        equ 273
+TOK_CONST       equ 274
+TOK_STATIC      equ 275
+TOK_UNSIGNED    equ 276
+TOK_SIGNED      equ 277
 
 ; Literals & Identifiers (280..289)
 TOK_IDENT       equ 280

@@ -112,9 +112,27 @@ parse_type:
     mov r8, TYPE_DESC_SIZE
     call mem_set
 
+.qual_loop:
+    mov rax, [rel tok_type]
+    cmp rax, TOK_CONST
+    je .skip_qual
+    cmp rax, TOK_STATIC
+    je .skip_qual
+    cmp rax, TOK_UNSIGNED
+    je .skip_qual
+    cmp rax, TOK_SIGNED
+    je .skip_qual
+    jmp .chk_type
+.skip_qual:
+    call next_token
+    jmp .qual_loop
+
+.chk_type:
     mov rax, [rel tok_type]
     cmp rax, TOK_INT
     je .is_int
+    cmp rax, TOK_LONG
+    je .is_long
     cmp rax, TOK_CHAR
     je .is_char
     cmp rax, TOK_VOID
@@ -123,6 +141,17 @@ parse_type:
     je .is_struct
     ; Default to int if identifier or unrecognized
     mov qword [rdi + 0], TYPE_INT
+    jmp .stars
+
+.is_long:
+    mov qword [rdi + 0], TYPE_INT
+    call next_token
+    cmp qword [rel tok_type], TOK_LONG
+    je .eat_long2
+    cmp qword [rel tok_type], TOK_INT
+    jne .stars
+.eat_long2:
+    call next_token
     jmp .stars
 
 .is_int:
@@ -1772,11 +1801,21 @@ parse_stmt:
     mov rax, [rel tok_type]
     cmp rax, TOK_INT
     je .comp_decl
+    cmp rax, TOK_LONG
+    je .comp_decl
     cmp rax, TOK_CHAR
     je .comp_decl
     cmp rax, TOK_VOID
     je .comp_decl
     cmp rax, TOK_STRUCT
+    je .comp_decl
+    cmp rax, TOK_STATIC
+    je .comp_decl
+    cmp rax, TOK_CONST
+    je .comp_decl
+    cmp rax, TOK_UNSIGNED
+    je .comp_decl
+    cmp rax, TOK_SIGNED
     je .comp_decl
 
     call parse_stmt
@@ -1912,6 +1951,17 @@ parse_global_decl_or_func:
     call next_token
 
 .not_extern:
+.glob_qual_loop:
+    cmp qword [rel tok_type], TOK_STATIC
+    je .skip_glob_qual
+    cmp qword [rel tok_type], TOK_CONST
+    je .skip_glob_qual
+    jmp .chk_glob_struct
+.skip_glob_qual:
+    call next_token
+    jmp .glob_qual_loop
+
+.chk_glob_struct:
     ; Check if struct definition: struct Point { int x; int y; };
     cmp qword [rel tok_type], TOK_STRUCT
     jne .norm_decl
