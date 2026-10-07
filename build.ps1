@@ -45,7 +45,33 @@ $kernelBytes = [System.IO.File]::ReadAllBytes("$scriptDir\kernel\kernel.bin")
 $imgBytes = New-Object byte[] 1474560
 [System.Array]::Copy($bootBytes, 0, $imgBytes, 0, $bootBytes.Length)
 [System.Array]::Copy($kernelBytes, 0, $imgBytes, 512, $kernelBytes.Length)
-[System.IO.File]::WriteAllBytes("$scriptDir\custom_c_os.img", $imgBytes)
+
+$imgPath = "$scriptDir\custom_c_os.img"
+try {
+    [System.IO.File]::WriteAllBytes($imgPath, $imgBytes)
+} catch [System.IO.IOException] {
+    Write-Host "[!] $imgPath er i bruk av en kjorende emulator/container (QEMU/Docker)." -ForegroundColor Yellow
+    Write-Host "    Stopper kjorende instanser for aa frigi filen..." -ForegroundColor Yellow
+
+    # Stopp lokale qemu-prosesser hvis de kjorer
+    Get-Process *qemu* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # Stopp docker-containere som bruker dev-real-dos
+    if (Get-Command docker -ErrorAction SilentlyContinue) {
+        $cIds = docker ps -q --filter ancestor=dev-real-dos 2>$null
+        if ($cIds) {
+            docker stop $cIds 2>$null | Out-Null
+        }
+    }
+
+    Start-Sleep -Milliseconds 600
+    try {
+        [System.IO.File]::WriteAllBytes($imgPath, $imgBytes)
+    } catch {
+        Write-Error "[!] Feil: Kunne ikke skrive til $imgPath fordi den er last. Lukk QEMU/Docker og prov igjen."
+        exit 1
+    }
+}
 
 $imgSize = (Get-Item "$scriptDir\custom_c_os.img").Length
 Write-Host "      [OK] $scriptDir\custom_c_os.img generert ($imgSize bytes)" -ForegroundColor Green
