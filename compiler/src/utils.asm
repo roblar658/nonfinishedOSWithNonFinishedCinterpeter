@@ -289,25 +289,30 @@ emit_i64:
 compile_error:
     mov rbx, rcx            ; save error message
     and rsp, -16            ; force 16-byte stack alignment
-    sub rsp, 16
+    sub rsp, 48
 
-    lea rdi, [rel str_err_prefix]
-    xor eax, eax
+    sub rsp, 32
+    lea rcx, [rel str_err_prefix]
     call printf
+    add rsp, 32
 
-    lea rdi, [rel str_err_pos]
-    mov rsi, [rel cur_line]
-    mov rdx, [rel cur_col]
-    xor eax, eax
+    sub rsp, 32
+    lea rcx, [rel str_err_pos]
+    mov rdx, [rel cur_line]
+    mov r8, [rel cur_col]
     call printf
+    add rsp, 32
 
-    lea rdi, [rel str_err_msg]
-    mov rsi, rbx
-    mov rdx, [rel tok_type]
-    lea rcx, [rel tok_str]
-    xor eax, eax
+    sub rsp, 32
+    lea rcx, [rel str_err_msg]
+    mov rdx, rbx
+    mov r8, [rel tok_type]
+    lea r9, [rel tok_str]
     call printf
+    add rsp, 32
 
-    mov rdi, 1
+    sub rsp, 32
+    mov rcx, 1
     call exit
+    add rsp, 32
 

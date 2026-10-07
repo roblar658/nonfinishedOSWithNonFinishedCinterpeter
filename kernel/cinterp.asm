@@ -65,8 +65,15 @@ CI_MAX_VARS     equ 128
 CI_FUNCS        equ 0xAC00      ; funksjonstabell (1 KB: 0xAC00..0xB000)
 CI_FUNC_SIZE    equ 20          ; navn[16], posisjon dw, pad dw
 CI_MAX_FUNCS    equ 32
-CI_HEAP         equ 0xB000      ; array-minne (2 KB: 0xB000..0xB800)
-CI_HEAP_END     equ 0xB800
+K_SIZEOF        equ 179
+
+CI_HEAP         equ 0x8000      ; array-minne (12 KB: 0x8000..0xB000)
+CI_HEAP_END     equ 0xB000
+CI_DYN_HEAP     equ 0xB000      ; dynamisk heap (malloc/free) (2 KB: 0xB000..0xB800)
+CI_DYN_HEAP_END equ 0xB800
+
+CI_MAX_STRUCTS  equ 8
+CI_STRUCT_SIZE  equ 160         ; tag[16], total_size dw, member_count dw, members[8 * 16]
 FS_POOL         equ 0xB800      ; lagrede filer fra editoren (14 KB: 0xB800..0xF000)
 FS_POOL_END     equ 0xF000
 CI_STACK_MIN    equ 0xF000      ; stakkgrense (rekursjonsvern, 4 KB stakk 0xF000..0xFFFE)
@@ -155,6 +162,8 @@ ci_reset:
     mov byte [ci_ctl], 0
     mov byte [ci_last_char], 10
     mov word [ci_heap_top], CI_HEAP
+    mov word [ci_dyn_top], CI_DYN_HEAP
+    mov word [ci_struct_count], 0
     ret
 
 ; ------------------------------------------------------------------------------
@@ -809,47 +818,23 @@ ci_consume_type:
     jmp .skip_ptrs
 
 .type_struct:
-    ; Sjekk om det er struct definisjon med kropp '{' (f.eks. struct Foo { ... };)
-    ; I sa fall ma den handteres av struct-deklarasjonshandtereren, ikke her
-    push word [ci_pos]
-    push word [tok_start]
-    push dword [tok_num]
-    push word [tok_sptr]
-    push word [tok_name]
-    push word [tok_name+2]
-    push word [tok_name+4]
-    push word [tok_name+6]
-    push word [tok_name+8]
-    push word [tok_name+10]
-    push word [tok_name+12]
-    push word [tok_name+14]
-    push word [tok_type]
-    call ci_lex
-    cmp byte [tok_type], T_IDENT
-    jne .ts_chk_brace
-    call ci_lex
-.ts_chk_brace:
-    cmp byte [tok_type], '{'
-    pop word [tok_type]
-    pop word [tok_name+14]
-    pop word [tok_name+12]
-    pop word [tok_name+10]
-    pop word [tok_name+8]
-    pop word [tok_name+6]
-    pop word [tok_name+4]
-    pop word [tok_name+2]
-    pop word [tok_name]
-    pop word [tok_sptr]
-    pop dword [tok_num]
-    pop word [tok_start]
-    pop word [ci_pos]
-    je .not_a_type              ; la .handle_struct_decl ta den!
+    call ci_is_struct_def_lookahead
+    je .not_a_type              ; la struct-def parseren ta definisjoner!
 
     call ci_lex                 ; spis 'struct'
     cmp byte [tok_type], T_IDENT
     jne .not_a_type
-    call ci_lex                 ; spis navnet pa strukturen
-    mov dl, K_INT
+
+    push si
+    push di
+    mov si, tok_name
+    mov di, ci_cur_struct_tag
+    call copy_str
+    pop di
+    pop si
+
+    call ci_lex                 ; spis struct tag
+    mov dl, K_STRUCT            ; type er K_STRUCT
     jmp .skip_ptrs
 
 .is_char:
@@ -940,6 +925,249 @@ ci_skip_until_semi:             ; Hopper over tokens til og med ';'
 .sus_eof:
     ret
 
+
+; ==============================================================================
+; Struct-handtering for tolken
+; ==============================================================================
+ci_find_struct:                 ; SI = tag -> BX = struct-oppforing, CF=0 ok, CF=1 feil
+    push ax
+    push cx
+    push di
+    mov cx, [ci_struct_count]
+    test cx, cx
+    jz .fs_nf
+    mov bx, ci_struct_table
+.fs_l:
+    mov di, bx
+    call str_equals
+    je .fs_found
+    add bx, CI_STRUCT_SIZE
+    loop .fs_l
+.fs_nf:
+    pop di
+    pop cx
+    pop ax
+    stc
+    ret
+.fs_found:
+    pop di
+    pop cx
+    pop ax
+    clc
+    ret
+
+ci_find_struct_size:            ; SI = tag -> AX = total storrelse i bytes
+    push bx
+    call ci_find_struct
+    jc .fss_def
+    mov ax, [bx + 16]           ; total_size
+    test ax, ax
+    jnz .fss_ret
+.fss_def:
+    mov ax, 16                  ; standardstørrelse hvis ukjent
+.fss_ret:
+    pop bx
+    ret
+
+ci_find_member_offset:          ; SI = medlemsnavn -> DX = offset i bytes, CF=0 ok
+    push ax
+    push bx
+    push cx
+    push si
+    push di
+    mov cx, [ci_struct_count]
+    test cx, cx
+    jz .fmo_nf
+    mov bx, ci_struct_table
+.fmo_s_loop:
+    push cx
+    mov cx, [bx + 18]           ; member_count
+    test cx, cx
+    jz .fmo_next_s
+    lea di, [bx + 20]           ; forste medlem
+.fmo_m_loop:
+    push si
+    push di
+    call str_equals
+    pop di
+    pop si
+    je .fmo_found
+    add di, 16                  ; neste medlem (hvert medlem er 16 bytes)
+    loop .fmo_m_loop
+.fmo_next_s:
+    pop cx
+    add bx, CI_STRUCT_SIZE
+    loop .fmo_s_loop
+.fmo_nf:
+    pop di
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    xor dx, dx
+    stc
+    ret
+.fmo_found:
+    mov dx, [di + 12]           ; offset lagret pa di + 12
+    pop cx
+    pop di
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    clc
+    ret
+
+ci_is_struct_def_lookahead:     ; ZF=1 hvis '{' folger (definisjon), ZF=0 hvis variabeldeklarasjon
+    push word [ci_pos]
+    push word [tok_start]
+    push dword [tok_num]
+    push word [tok_sptr]
+    push word [tok_name]
+    push word [tok_name+2]
+    push word [tok_name+4]
+    push word [tok_name+6]
+    push word [tok_name+8]
+    push word [tok_name+10]
+    push word [tok_name+12]
+    push word [tok_name+14]
+    push word [tok_type]
+    call ci_lex                 ; spis 'struct'
+    cmp byte [tok_type], T_IDENT
+    jne .isd_chk
+    call ci_lex                 ; spis tagnavn
+.isd_chk:
+    cmp byte [tok_type], '{'
+    pop word [tok_type]
+    pop word [tok_name+14]
+    pop word [tok_name+12]
+    pop word [tok_name+10]
+    pop word [tok_name+8]
+    pop word [tok_name+6]
+    pop word [tok_name+4]
+    pop word [tok_name+2]
+    pop word [tok_name]
+    pop word [tok_sptr]
+    pop dword [tok_num]
+    pop word [tok_start]
+    pop word [ci_pos]
+    ret
+
+ci_parse_struct_def:
+    call ci_lex                 ; spis 'struct'
+    mov byte [ci_struct_tmp_tag], 0
+    cmp byte [tok_type], T_IDENT
+    jne .psd_nobrace
+    push si
+    push di
+    mov si, tok_name
+    mov di, ci_struct_tmp_tag
+    call copy_str
+    pop di
+    pop si
+    call ci_lex                 ; spis tagnavn
+.psd_nobrace:
+    cmp byte [tok_type], '{'
+    jne .psd_skip_semi
+    call ci_lex                 ; spis '{'
+
+    mov bx, [ci_struct_count]
+    cmp bx, CI_MAX_STRUCTS
+    jae .psd_table_full
+    imul bx, bx, CI_STRUCT_SIZE
+    add bx, ci_struct_table
+
+    push si
+    push di
+    mov si, ci_struct_tmp_tag
+    mov di, bx
+    call copy_str
+    pop di
+    pop si
+
+    mov word [bx + 16], 0       ; total_size
+    mov word [bx + 18], 0       ; member_count
+    xor dx, dx                  ; DX = curr_offset
+    xor cx, cx                  ; CX = curr_member_count
+
+.psd_mem_loop:
+    cmp byte [tok_type], '}'
+    je .psd_body_end
+    cmp byte [tok_type], T_EOF
+    je .psd_body_end
+
+    call ci_consume_type
+    jc .psd_skip_line
+
+    cmp byte [tok_type], T_IDENT
+    jne .psd_skip_line
+
+    cmp cx, 8
+    jae .psd_mem_skip_store
+
+    push bx
+    mov ax, cx
+    shl ax, 4                   ; cx * 16
+    add bx, 20
+    add bx, ax
+
+    push si
+    push di
+    mov si, tok_name
+    mov di, bx
+    call copy_str
+    pop di
+    pop si
+
+    mov [bx + 12], dx           ; offset
+    mov word [bx + 14], 4       ; size
+    pop bx
+    inc cx
+
+.psd_mem_skip_store:
+    call ci_lex                 ; spis medlemsnavn
+    cmp byte [tok_type], '['
+    jne .psd_mem_scalar
+    call ci_lex
+    call ci_expr
+    EXPECT ']'
+    shl eax, 2
+    add edx, eax
+    jmp .psd_mem_semi
+.psd_mem_scalar:
+    add dx, 4
+
+.psd_mem_semi:
+    EXPECT ';'
+    jmp .psd_mem_loop
+
+.psd_skip_line:
+    call ci_skip_until_semi
+    jmp .psd_mem_loop
+
+.psd_body_end:
+    EXPECT '}'
+    add dx, 3
+    and dx, ~3
+    test dx, dx
+    jnz .psd_sz_ok
+    mov dx, 4
+.psd_sz_ok:
+    mov [bx + 16], dx           ; total_size
+    mov [bx + 18], cx           ; member_count
+    inc word [ci_struct_count]
+    jmp .psd_skip_semi
+
+.psd_table_full:
+    call ci_skip_braces
+
+.psd_skip_semi:
+    cmp byte [tok_type], ';'
+    jne .psd_done
+    call ci_lex
+.psd_done:
+    ret
+
 ci_prepass:
     mov ax, [ci_src]
     call ci_lex_at
@@ -960,11 +1188,19 @@ ci_prepass:
 
     ; struct / union / enum definisjoner
     cmp al, K_STRUCT
-    je .handle_struct_decl
+    jne .not_tl_struct
+    call ci_is_struct_def_lookahead
+    jne .not_tl_struct_def
+    call ci_parse_struct_def
+    jmp .top
+.not_tl_struct_def:
+    jmp .try_consume_type
+.not_tl_struct:
     cmp al, K_UNION
     je .handle_struct_decl
     cmp al, K_ENUM
     je .handle_struct_decl
+.try_consume_type:
 
     ; typedef
     cmp al, K_TYPEDEF
@@ -1039,6 +1275,7 @@ ci_prepass:
 
 .typ:
     mov [ci_cur_decl_type], al
+    mov [ci_is_ptr_decl], dh
     cmp byte [tok_type], T_IDENT
     jne .name_err
     mov si, tok_name
@@ -1052,6 +1289,7 @@ ci_prepass:
     pop ax
     call ci_lex_at
     mov byte [ci_exec], 1
+    mov dh, [ci_is_ptr_decl]
     call ci_decl_rest
     mov byte [ci_exec], 0
     mov ax, [ci_var_count]
@@ -1139,14 +1377,21 @@ ci_statement:
     cmp al, T_EOF
     je .eof
     cmp al, K_STRUCT
-    je .stmt_struct
+    jne .not_st_struct
+    call ci_is_struct_def_lookahead
+    jne .not_st_struct_def
+    call ci_parse_struct_def
+    ret
+.not_st_struct_def:
+    jmp .stmt_try_consume
+.not_st_struct:
     cmp al, K_UNION
     je .stmt_struct
     cmp al, K_ENUM
     je .stmt_struct
     cmp al, K_TYPEDEF
     je .stmt_typedef
-
+.stmt_try_consume:
     call ci_consume_type
     jnc .decl_typed
 
@@ -1170,6 +1415,7 @@ ci_statement:
     ret
 .decl_typed:
     mov [ci_cur_decl_type], al
+    mov [ci_is_ptr_decl], dh
     jmp ci_decl_rest
 .stmt_typedef:
     call ci_lex
@@ -1237,9 +1483,11 @@ ci_block:
 
 ; Etter typenokkelord: navn [= uttrykk] | navn[N] [= {..}] , ... ;
 ci_decl_rest:
+    mov [ci_is_ptr_decl], dh
 .skip_p_decl:
     cmp byte [tok_type], '*'
     jne .not_ptr_decl
+    mov byte [ci_is_ptr_decl], 1
     call ci_lex
     jmp .skip_p_decl
 .not_ptr_decl:
@@ -1252,6 +1500,72 @@ ci_decl_rest:
     call ci_lex
     cmp byte [tok_type], '['
     je .array
+
+    ; Sjekk om det er en verdi-struct (ci_cur_decl_type == K_STRUCT og ci_is_ptr_decl == 0):
+    cmp byte [ci_cur_decl_type], K_STRUCT
+    jne .not_struct_val_decl
+    cmp byte [ci_is_ptr_decl], 1
+    je .not_struct_val_decl
+
+    ; Alloker struct verdi pa ci_heap_top:
+    push si
+    mov si, ci_cur_struct_tag
+    call ci_find_struct_size    ; AX = storrelse i bytes
+    pop si
+    mov di, [ci_heap_top]
+    add [ci_heap_top], ax
+    ; Nullstill struct-minne
+    push di
+    push cx
+    mov cx, ax
+    xor al, al
+    rep stosb
+    pop cx
+    pop di
+
+    cmp byte [ci_exec], 0
+    je .sv_skip_init
+    mov si, sp                  ; variabelnavn
+    call ci_add_var
+    mov byte [bx+15], 4         ; flagg for struct-verdi!
+    mov [bx+16], di             ; adresse
+    mov [bx+20], di             ; adresse
+    mov [bx+22], ax             ; storrelse
+.sv_skip_init:
+    cmp byte [tok_type], '='
+    jne .next
+    call ci_lex                 ; spis '='
+    cmp byte [tok_type], '{'
+    jne .sv_init_expr
+    call ci_lex                 ; spis '{'
+    xor dx, dx                  ; felt-offset
+.sv_init_loop:
+    push dx
+    push di
+    call ci_expr
+    pop di
+    pop dx
+    cmp byte [ci_exec], 0
+    je .sv_init_skip
+    mov bx, di
+    add bx, dx
+    mov [bx], eax
+.sv_init_skip:
+    add dx, 4
+    cmp byte [tok_type], ','
+    jne .sv_init_end
+    call ci_lex
+    jmp .sv_init_loop
+.sv_init_end:
+    EXPECT '}'
+    jmp .next
+.sv_init_expr:
+    push di
+    call ci_expr
+    pop di
+    jmp .next
+
+.not_struct_val_decl:
     xor eax, eax
     cmp byte [tok_type], '='
     jne .sc_add
@@ -1273,28 +1587,55 @@ ci_decl_rest:
     jmp .next
 
 .array:
-    call ci_lex
-    xor ecx, ecx
+    ; Parse N dimensjoner: [D0][D1]...[Dn-1]
+    mov word [ci_arr_dim_cnt], 0
+    mov dword [ci_arr_tot_elems], 1
+.arr_dim_loop:
+    call ci_lex                 ; spis '['
+    xor eax, eax
     cmp byte [tok_type], ']'
-    je .arr_nosize
-    call ci_expr
-    mov ecx, eax
-.arr_nosize:
+    je .arr_dim_empty
+    call ci_expr                ; EAX = dimension size
+.arr_dim_empty:
     EXPECT ']'
-    mov word [ci_tmp_dim2], 0
+    test eax, eax
+    jnz .arr_dim_has_sz
+    mov eax, 1
+.arr_dim_has_sz:
+    mov bx, [ci_arr_dim_cnt]
+    cmp bx, 8
+    jae .size_err
+    shl bx, 1
+    mov [ci_arr_dims + bx], ax  ; lagre dimensjonsstorrelse
+    inc word [ci_arr_dim_cnt]
+
+    ; Oppdater produkt
+    movzx edx, ax
+    imul edx, [ci_arr_tot_elems]
+    mov [ci_arr_tot_elems], edx
+
     cmp byte [tok_type], '['
-    jne .not_2d_decl
-    call ci_lex
-    push ecx
-    call ci_expr
-    mov [ci_tmp_dim2], ax
-    EXPECT ']'
-    pop ecx
-    movzx edx, word [ci_tmp_dim2]
-    imul ecx, edx
-.not_2d_decl:
+    je .arr_dim_loop
+
+    ; Lagre dimensjonsheader pa ci_heap_top: dw dim_count, dw dim0, dw dim1, ...
     mov di, [ci_heap_top]
-    xor dx, dx
+    mov ax, [ci_arr_dim_cnt]
+    mov [di], ax                ; dim_count
+    mov [ci_arr_dim_hdr], di
+    add di, 2
+
+    mov cx, [ci_arr_dim_cnt]
+    xor bx, bx
+.arr_copy_d:
+    mov ax, [ci_arr_dims + bx]
+    mov [di], ax
+    add di, 2
+    add bx, 2
+    loop .arr_copy_d
+
+    ; DI peker na pa start av array-data!
+    ; Sjekk array initialisering med '{'
+    xor dx, dx                  ; DX = antall initialiserte elementer
     cmp byte [tok_type], '='
     jne .arr_fill
     call ci_lex
@@ -1302,13 +1643,11 @@ ci_decl_rest:
     cmp byte [tok_type], '}'
     je .init_end
 .init_loop:
-    push ecx
-    push di
     push dx
+    push di
     call ci_expr
-    pop dx
     pop di
-    pop ecx
+    pop dx
     cmp byte [ci_exec], 0
     je .init_skip
     mov bx, dx
@@ -1325,25 +1664,27 @@ ci_decl_rest:
     jmp .init_loop
 .init_end:
     EXPECT '}'
+
 .arr_fill:
+    mov ecx, [ci_arr_tot_elems]
     test ecx, ecx
-    jnz .have_len
+    jnz .have_tot_len
     movzx ecx, dx
-.have_len:
+.have_tot_len:
     cmp byte [ci_exec], 0
     je .next
     cmp ecx, 0
     jle .size_err
-    cmp ecx, 1024
+    cmp ecx, 4096
     jg .size_err
-    movzx ebx, dx
-    cmp ecx, ebx
-    jb .size_err
+
     mov bx, cx
     shl bx, 2
     add bx, di
     cmp bx, CI_HEAP_END
     ja .mem_err
+
+    ; Nullstill minne
     mov bx, dx
 .zero:
     cmp bx, cx
@@ -1356,21 +1697,24 @@ ci_decl_rest:
     inc bx
     jmp .zero
 .zdone:
-    mov si, sp
+    mov si, sp                  ; SI peker pa variabelnavn pa stakken
     xor eax, eax
     call ci_add_var
-    mov ax, [ci_tmp_dim2]
-    mov [bx+16], ax
-    mov [bx+20], di
-    mov [bx+22], cx
+    mov ax, [ci_arr_dim_hdr]
+    mov [bx+16], ax             ; [bx+16] = dim_hdr peker!
+    mov [bx+20], di             ; [bx+20] = data peker!
+    mov [bx+22], cx             ; [bx+22] = totalt elementer!
     shl cx, 2
-    add [ci_heap_top], cx
+    add di, cx
+    mov [ci_heap_top], di
+    jmp .next
 
 .next:
     add sp, 16
     cmp byte [tok_type], ','
     jne .end
     call ci_lex
+    xor dh, dh
     jmp ci_decl_rest
 .end:
     EXPECT ';'
@@ -1531,6 +1875,7 @@ ci_for:
     jmp .init_done
 .init_decl:
     mov [ci_cur_decl_type], al
+    mov [ci_is_ptr_decl], dh
     call ci_decl_rest
     jmp .init_done
 .init_empty:
@@ -2166,6 +2511,8 @@ ci_multiplicative:
 
 ci_unary:
     mov bl, [tok_type]
+    cmp bl, K_SIZEOF
+    je .unary_sizeof
     cmp bl, '-'
     je .neg
     cmp bl, '+'
@@ -2204,6 +2551,54 @@ ci_unary:
     movzx eax, ax
     mov word [ci_lv], 0
     ret
+.unary_sizeof:
+    call ci_lex                 ; spis 'sizeof'
+    EXPECT '('
+    cmp byte [tok_type], K_STRUCT
+    je .sz_struct
+    cmp byte [tok_type], K_INT
+    je .sz_4
+    cmp byte [tok_type], K_LONG
+    je .sz_4
+    cmp byte [tok_type], K_DOUBLE
+    je .sz_4
+    cmp byte [tok_type], K_FLOAT
+    je .sz_4
+    cmp byte [tok_type], K_CHAR
+    je .sz_1
+    call ci_expr
+    EXPECT ')'
+    mov eax, 4
+    mov word [ci_lv], 0
+    ret
+.sz_struct:
+    call ci_lex                 ; spis 'struct'
+    mov si, tok_name
+    call ci_find_struct_size
+    call ci_lex                 ; spis tagnavn
+    EXPECT ')'
+    movzx eax, ax
+    mov word [ci_lv], 0
+    ret
+.sz_4:
+    call ci_lex
+.sz_eat_ptr:
+    cmp byte [tok_type], '*'
+    jne .sz_eat_rparen
+    call ci_lex
+    jmp .sz_eat_ptr
+.sz_eat_rparen:
+    EXPECT ')'
+    mov eax, 4
+    mov word [ci_lv], 0
+    ret
+.sz_1:
+    call ci_lex
+    EXPECT ')'
+    mov eax, 1
+    mov word [ci_lv], 0
+    ret
+
 .neg:
     call ci_lex
     call ci_unary
@@ -2374,6 +2769,10 @@ ci_primary:
     call ci_lex                 ; spis '.'
     cmp byte [tok_type], T_IDENT
     jne .err_name
+    push si
+    mov si, tok_name
+    call ci_find_member_offset  ; DX = offset
+    pop si
     call ci_lex                 ; spis medlemsnavn
     cmp byte [ci_exec], 0
     jne .post_dot_live
@@ -2387,13 +2786,19 @@ ci_primary:
     xor eax, eax
     jmp .postfix_loop
 .post_dot_ok:
+    add di, dx
     mov eax, [di]
+    mov [ci_lv], di
     jmp .postfix_loop
 
 .post_arrow:
     call ci_lex                 ; spis '->'
     cmp byte [tok_type], T_IDENT
     jne .err_name
+    push si
+    mov si, tok_name
+    call ci_find_member_offset  ; DX = offset
+    pop si
     call ci_lex                 ; spis medlemsnavn
     cmp byte [ci_exec], 0
     jne .post_arrow_live
@@ -2403,12 +2808,15 @@ ci_primary:
 .post_arrow_live:
     test eax, eax
     jz .post_arrow_null
-    mov di, ax
+    mov di, ax                  ; DI = struct peker fra EAX
+    add di, dx                  ; DI = struct peker + member offset
     mov eax, [di]
+    mov [ci_lv], di
     jmp .postfix_loop
 .post_arrow_null:
     mov di, ci_dummy
     xor eax, eax
+    mov word [ci_lv], 0
     jmp .postfix_loop
 
 .post_index:
@@ -2510,12 +2918,19 @@ ci_var_ref:
     cmp byte [bx+15], 2
     sete al
     mov [ci_is_float], al
+    cmp byte [bx+15], 4         ; struct-verdi!
+    je .is_struct_val
     cmp word [bx+20], 0
     jne .array
     cmp byte [tok_type], '['
     je .ptr_idx
     lea di, [bx+16]
     mov eax, [di]
+    ret
+.is_struct_val:
+    mov di, [bx+20]             ; basert pa struct-adresse
+    movzx eax, di
+    mov [ci_lv], di
     ret
 .ptr_idx:
     push bx
@@ -2529,6 +2944,7 @@ ci_var_ref:
     shl ax, 2
     add di, ax
     mov eax, [di]
+    mov [ci_lv], di
     ret
 .ptr_dum:
     mov di, ci_dummy
@@ -2537,28 +2953,69 @@ ci_var_ref:
 .array:
     cmp byte [tok_type], '['
     jne .bare_arr
+
+    ; Vi har klammer for indeksering!
+    mov si, [bx+16]             ; SI = dimensjonsheader
+    test si, si
+    jz .simple_1d_fallback
+
+    mov cx, [si]                ; CX = dim_count
+    add si, 2                   ; SI peker pa dim0, dim1...
+
+    xor edx, edx                ; EDX = lpende flat offset
+    xor di, di                  ; DI = klammeindeks (0..dim_count-1)
+
+.arr_idx_loop:
     push bx
+    push si
+    push cx
+    push edx
+    push di
+    call ci_lex                 ; spis '['
+    call ci_expr                ; EAX = indeks
+    EXPECT ']'
+    pop di
+    pop edx
+    pop cx
+    pop si
+    pop bx
+
+    test di, di
+    jz .arr_first_dim
+    ; Multipliser tidligere offset med denne dimensjonens storrelse:
+    push bx
+    mov bx, di
+    shl bx, 1
+    movzx ebp, word [si + bx]
+    pop bx
+    imul edx, ebp
+.arr_first_dim:
+    add edx, eax
+    inc di
+
+    cmp byte [tok_type], '['
+    jne .arr_idx_done
+    cmp di, cx
+    jb .arr_idx_loop
+
+.arr_idx_done:
+    mov eax, edx
+    cmp eax, 0
+    jl .bounds
+    movzx ecx, word [bx+22]
+    cmp eax, ecx
+    jge .bounds
+    mov di, [bx+20]             ; data peker
+    shl ax, 2
+    add di, ax
+    mov eax, [di]
+    mov [ci_lv], di
+    ret
+
+.simple_1d_fallback:
     call ci_lex
     call ci_expr
     EXPECT ']'
-    pop bx
-    cmp byte [tok_type], '['
-    jne .idx_1d
-    push bx
-    push eax                    ; lagre i (rad)
-    call ci_lex
-    call ci_expr                ; EAX = j (kolonne)
-    EXPECT ']'
-    pop edx                     ; EDX = i
-    pop bx
-    movzx ecx, word [bx+16]     ; ECX = dim2 (kolonner)
-    test ecx, ecx
-    jnz .have_stride
-    mov ecx, 1
-.have_stride:
-    imul edx, ecx
-    add eax, edx                ; EAX = i * dim2 + j
-.idx_1d:
     cmp eax, 0
     jl .bounds
     movzx ecx, word [bx+22]
@@ -2568,7 +3025,9 @@ ci_var_ref:
     shl ax, 2
     add di, ax
     mov eax, [di]
+    mov [ci_lv], di
     ret
+
 .bare_arr:
     mov di, [bx+20]
     movzx eax, di
@@ -2600,6 +3059,12 @@ ci_call:
     mov di, ci_s_puts
     call str_equals
     je ci_puts
+    mov di, ci_s_malloc
+    call str_equals
+    je ci_malloc
+    mov di, ci_s_free
+    call str_equals
+    je ci_free
 
     push si
     call ci_lex
@@ -3178,6 +3643,52 @@ ci_puts:
     xor eax, eax
     ret
 
+ci_malloc:
+    call ci_lex                 ; spis '('
+    call ci_expr                ; EAX = onsket storrelse
+    EXPECT ')'
+    cmp byte [ci_exec], 0
+    je .m_skip
+    add eax, 3
+    and eax, ~3
+    test eax, eax
+    jnz .m_have_sz
+    mov eax, 4
+.m_have_sz:
+    mov bx, [ci_dyn_top]
+    mov edx, eax
+    add dx, bx
+    cmp dx, CI_DYN_HEAP_END
+    ja .m_oom
+    mov [ci_dyn_top], dx
+    push di
+    push cx
+    mov di, bx
+    mov cx, ax
+    xor al, al
+    rep stosb
+    pop cx
+    pop di
+    movzx eax, bx
+    mov word [ci_lv], 0
+    ret
+.m_oom:
+    xor eax, eax
+    mov word [ci_lv], 0
+    ret
+.m_skip:
+    xor eax, eax
+    mov word [ci_lv], 0
+    ret
+
+ci_free:
+    call ci_lex                 ; spis '('
+    call ci_expr
+    EXPECT ')'
+    xor eax, eax
+    mov word [ci_lv], 0
+    ret
+
 ; ------------------------------------------------------------------------------
 ; Utskrift
 ; ------------------------------------------------------------------------------
@@ -3410,6 +3921,8 @@ ci_keywords:
     db K_INT
     dw kw_uint64_t
     db K_INT
+    dw kw_sizeof
+    db K_SIZEOF
     dw kw_struct
     db K_STRUCT
     dw kw_union
@@ -3457,6 +3970,7 @@ kw_int32_t      db "int32_t", 0
 kw_uint32_t     db "uint32_t", 0
 kw_int64_t      db "int64_t", 0
 kw_uint64_t     db "uint64_t", 0
+kw_sizeof       db "sizeof", 0
 kw_struct       db "struct", 0
 kw_union        db "union", 0
 kw_enum         db "enum", 0
@@ -3519,6 +4033,21 @@ ci_e_fmt        db "printf krever en formatstreng", 0
 ci_e_few        db "for fa argumenter til printf", 0
 ci_e_spec       db "ukjent printf-format (bruk %d %c %s %x)", 0
 ci_e_abort      db "avbrutt av bruker (ESC)", 0
+
+ci_dyn_top          dw CI_DYN_HEAP
+ci_struct_count     dw 0
+ci_cur_struct_tag   times 16 db 0
+ci_struct_tmp_tag   times 16 db 0
+ci_struct_table     times (CI_MAX_STRUCTS * CI_STRUCT_SIZE) db 0
+ci_is_ptr_decl      db 0
+
+ci_s_malloc         db "malloc", 0
+ci_s_free           db "free", 0
+
+ci_arr_dims         times 8 dw 0
+ci_arr_dim_cnt      dw 0
+ci_arr_tot_elems    dd 0
+ci_arr_dim_hdr      dw 0
 
 ci_tmp_dim2     dw 0
 ci_src          dw 0

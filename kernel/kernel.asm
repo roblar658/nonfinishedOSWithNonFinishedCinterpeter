@@ -1494,6 +1494,40 @@ cmd_edit:
 
 .do_replace:
     inc si                      ; hopp over 'r'
+    ; Tillat ':replace'
+    cmp word [si], 0x7065       ; 'ep'
+    jne .chk_r_skip_initial_sp
+.skip_replace_word:
+    cmp byte [si], ' '
+    je .chk_r_skip_initial_sp
+    cmp byte [si], 0
+    je .chk_r_skip_initial_sp
+    inc si
+    jmp .skip_replace_word
+
+.chk_r_skip_initial_sp:
+    cmp byte [si], ' '
+    jne .chk_r_type
+    inc si
+    jmp .chk_r_skip_initial_sp
+
+.chk_r_type:
+    cmp byte [si], 0
+    je .r_show_curr             ; bare ':r' -> vis gjeldende linje
+    cmp byte [si], '0'
+    jb .r_replace_curr_line     ; ikke tall -> erstatt gjeldende linje!
+    cmp byte [si], '9'
+    jbe .do_shorthand_replace
+
+.r_replace_curr_line:
+    mov ax, [edit_cur_line]
+    jmp .do_actual_replace
+
+.r_show_curr:
+    mov ax, [edit_cur_line]
+    call show_selected_line
+    jmp .edit_loop
+
 .do_shorthand_replace:
     call parse_edit_num
     jc .err_ln
@@ -1517,7 +1551,6 @@ cmd_edit:
     jc .err_ln
     mov si, msg_edit_replaced
     call term_puts
-    inc ax
     mov [edit_cur_line], ax
     call show_selected_line
     jmp .edit_loop
@@ -1766,19 +1799,17 @@ replace_line:                   ; AX = linjenr, DX = ny tekst (nullterminert)
     push dx
     push si
     push di
+    push es
 
-    call find_line_n
+    call find_line_n            ; SI = start av linje, DI = start av neste linje (suffix)
     jc .rep_err
 
-    push si
-    push dx
-
-    ; 1. Kopier suffix fra DI til 0x2000:8000 (ES:BX, trygt adskilt fra rx_buf 0x0000..0x7FFF)
-    push es
+    ; 1. Kopier suffix fra DI til 0x2000:8000
     mov ax, 0x2000
     mov es, ax
     mov bx, 0x8000
-    mov si, di
+    push si                     ; lagre destinasjonsstart i edit_content_buf
+    mov si, di                  ; kilde er DI (suffix)
 .copy_suf:
     lodsb
     mov [es:bx], al
@@ -1786,10 +1817,14 @@ replace_line:                   ; AX = linjenr, DX = ny tekst (nullterminert)
     test al, al
     jnz .copy_suf
 
-    ; 2. Kopier ny tekst til start av linje AX
-    pop si
-    pop di
+    ; Gjenopprett ES = DS (0x1000) slik at stosb skriver til edit_content_buf
+    mov ax, ds
+    mov es, ax
 
+    pop di                      ; DI = start av linje i edit_content_buf
+    mov si, dx                  ; SI = peker til ny tekst i DS
+
+    ; 2. Kopier ny tekst til DI
 .copy_new:
     lodsb
     test al, al
@@ -1802,19 +1837,23 @@ replace_line:                   ; AX = linjenr, DX = ny tekst (nullterminert)
     mov byte [di], 10
     inc di
 
-    ; 3. Kopier suffix tilbake fra 0x2000:8000
-    mov bx, 0x8000
+    ; 3. Kopier suffix tilbake fra 0x2000:8000 til ES:DI
+    push ds
+    mov ax, 0x2000
+    mov ds, ax
+    mov si, 0x8000
 .copy_back:
-    mov al, [es:bx]
-    inc bx
-    stosb
+    lodsb
+    mov [es:di], al
+    inc di
     test al, al
     jnz .copy_back
-    pop es
+    pop ds                      ; gjenopprett DS = 0x1000
 
-    dec di
+    dec di                      ; DI peker pa nullterminatoren
     mov [edit_content_end], di
 
+    pop es
     pop di
     pop si
     pop dx
@@ -1825,6 +1864,7 @@ replace_line:                   ; AX = linjenr, DX = ny tekst (nullterminert)
     ret
 
 .rep_err:
+    pop es
     pop di
     pop si
     pop dx
@@ -2008,25 +2048,12 @@ do_c_compilation:
     ret
 
 execute_c_program:
-    ; Sjekk om det er struct_demo.c (krever struct-spesiell handtering)
-    mov si, compile_target_fname
-    mov di, str_struct_c
-    call str_equals
-    je .run_struct
-
-    ; For alle andre filer: finn kildekoden i filsystemet
     mov si, compile_target_fname
     call find_file
     jc .not_found
 
     ; SI peker pa C-kildekoden. Kjor via ci_run!
     call ci_run
-    ret
-
-.run_struct:
-    mov si, out_struct_c
-    call term_puts
-    xor eax, eax
     ret
 
 .not_found:
@@ -2064,7 +2091,7 @@ display_generated_asm:
 ; Virtuelt Filsystem (In-Memory File System)
 ; ==============================================================================
 init_filesystem:
-    mov word [file_count], 9
+    mov word [file_count], 11
 
     ; 1. hello.c
     mov di, file_table + 0*16
@@ -2119,6 +2146,18 @@ init_filesystem:
     mov si, str_lo_c
     call copy_str
     mov word [file_ptrs + 8*2], file_data_lo
+
+    ; 10. matrix.c
+    mov di, file_table + 9*16
+    mov si, str_matrix_c
+    call copy_str
+    mov word [file_ptrs + 9*2], file_data_matrix
+
+    ; 11. linked_list.c
+    mov di, file_table + 10*16
+    mov si, str_llist_c
+    call copy_str
+    mov word [file_ptrs + 10*2], file_data_llist
 
     ; Klargjor editor-buffer
     mov word [edit_content_end], edit_content_buf
@@ -2544,6 +2583,8 @@ str_qsort_c             db "quicksort.c", 0
 str_euler_c             db "euler.c", 0
 str_rk4_c               db "rk4.c", 0
 str_lo_c                db "lo.c", 0
+str_matrix_c            db "matrix.c", 0
+str_llist_c             db "linked_list.c", 0
 
 ; Forhandslagrede C-filer
 file_data_hello:
@@ -2797,6 +2838,57 @@ file_data_lo:
     db '        printf("| %-3d | %-10ld | %-10ld | %-13.6f | %-10ld |\n", n, kvadrat, kubikk, rot, lops_sum);', 13, 10
     db "    }", 13, 10
     db '    printf("+-----+------------+------------+---------------+------------+\n");', 13, 10
+    db "    return 0;", 13, 10
+    db "}", 13, 10, 0
+
+file_data_matrix:
+    db "#include <stdio.h>", 13, 10
+    db "int main() {", 13, 10
+    db "    int m[3][3];", 13, 10
+    db "    int i;", 13, 10
+    db "    int j;", 13, 10
+    db "    int count = 1;", 13, 10
+    db "    for (i = 0; i < 3; i++) {", 13, 10
+    db "        for (j = 0; j < 3; j++) {", 13, 10
+    db "            m[i][j] = count;", 13, 10
+    db "            count++;", 13, 10
+    db "        }", 13, 10
+    db "    }", 13, 10
+    db '    printf("3x3 Matrise:\n");', 13, 10
+    db '    printf("[%d, %d, %d]\n", m[0][0], m[0][1], m[0][2]);', 13, 10
+    db '    printf("[%d, %d, %d]\n", m[1][0], m[1][1], m[1][2]);', 13, 10
+    db '    printf("[%d, %d, %d]\n", m[2][0], m[2][1], m[2][2]);', 13, 10
+    db "    int diag_sum = m[0][0] + m[1][1] + m[2][2];", 13, 10
+    db '    printf("Diagonal sum: %d\n", diag_sum);', 13, 10
+    db "    return 0;", 13, 10
+    db "}", 13, 10, 0
+
+file_data_llist:
+    db "#include <stdio.h>", 13, 10
+    db "struct Node {", 13, 10
+    db "    int val;", 13, 10
+    db "    struct Node *next;", 13, 10
+    db "};", 13, 10
+    db "int main() {", 13, 10
+    db "    struct Node *head = malloc(sizeof(struct Node));", 13, 10
+    db "    struct Node *second = malloc(sizeof(struct Node));", 13, 10
+    db "    struct Node *third = malloc(sizeof(struct Node));", 13, 10
+    db "    head->val = 10;", 13, 10
+    db "    head->next = second;", 13, 10
+    db "    second->val = 20;", 13, 10
+    db "    second->next = third;", 13, 10
+    db "    third->val = 30;", 13, 10
+    db "    third->next = 0;", 13, 10
+    db '    printf("Lenket liste traversion:\n");', 13, 10
+    db "    struct Node *curr = head;", 13, 10
+    db "    while (curr) {", 13, 10
+    db '        printf("Node val: %d\n", curr->val);', 13, 10
+    db "        curr = curr->next;", 13, 10
+    db "    }", 13, 10
+    db "    free(third);", 13, 10
+    db "    free(second);", 13, 10
+    db "    free(head);", 13, 10
+    db '    printf("Heap minne frigjort!\n");', 13, 10
     db "    return 0;", 13, 10
     db "}", 13, 10, 0
 

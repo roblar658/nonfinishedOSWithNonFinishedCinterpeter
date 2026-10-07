@@ -1,3 +1,48 @@
+arr_desc_add:
+    ; RCX = sym_ptr, RDX = dim_count, R8 = dims_buf pointer
+    push rbx
+    push rsi
+    push rdi
+    mov rax, [rel arr_desc_count]
+    cmp rax, MAX_ARR_DESCS
+    jae .ada_done
+    imul rax, ARR_DESC_ENTRY_SIZE
+    lea rdi, [rel arr_desc_table]
+    add rdi, rax
+    mov [rdi], rcx          ; sym_ptr
+    mov [rdi + 8], rdx      ; dim_count
+    mov rsi, r8
+    lea rdi, [rdi + 16]     ; dims array
+    mov rcx, rdx
+    rep movsq
+    inc qword [rel arr_desc_count]
+.ada_done:
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+arr_desc_find:
+    ; RCX = sym_ptr
+    ; Output: RAX = pointer to arr_desc entry, or 0 if not found
+    xor eax, eax
+.adf_loop:
+    cmp rax, [rel arr_desc_count]
+    jae .adf_not_found
+    imul rdx, rax, ARR_DESC_ENTRY_SIZE
+    lea r10, [rel arr_desc_table]
+    add r10, rdx
+    cmp [r10], rcx
+    je .adf_found
+    inc rax
+    jmp .adf_loop
+.adf_found:
+    mov rax, r10
+    ret
+.adf_not_found:
+    xor eax, eax
+    ret
+
 ; ==============================================================================
 ; c_compiler_asm - Pure x86-64 Assembly C Compiler
 ; parser.asm - Recursive descent parser & syntax-directed code generator
@@ -267,9 +312,35 @@ parse_primary:
 
 .paren:
     call next_token         ; consume '('
+    ; Check if typecast: (type)expr
+    mov rax, [rel tok_type]
+    cmp rax, TOK_INT
+    je .is_cast
+    cmp rax, TOK_LONG
+    je .is_cast
+    cmp rax, TOK_CHAR
+    je .is_cast
+    cmp rax, TOK_VOID
+    je .is_cast
+    cmp rax, TOK_STRUCT
+    je .is_cast
+
+    ; Normal parenthesized expression: (expr)
     call parse_expr
     mov rcx, ')'
     call expect
+    jmp .ret
+
+.is_cast:
+    call parse_type
+    mov rcx, ')'
+    call expect
+    call parse_unary
+    lea rdi, [rel expr_type]
+    lea rdx, [rel type_tmp]
+    mov rcx, rdi
+    mov r8, TYPE_DESC_SIZE
+    call mem_copy
     jmp .ret
 
 .sizeof_expr:
@@ -321,6 +392,8 @@ parse_primary:
     ; Check if array: array name evaluates to its base address
     cmp qword [rsi + 64 + 16], 1
     je .arr_addr_local
+    mov qword [rel cur_arr_sym], 0
+    mov qword [rel cur_dim_idx], 0
     cmp qword [rsi + 64 + 0], TYPE_STRUCT
     jne .not_struct_local
     cmp qword [rsi + 64 + 8], 0
@@ -340,6 +413,12 @@ parse_primary:
     jmp .ret
 
 .arr_addr_local:
+    push rsi
+    mov rcx, rsi
+    call arr_desc_find
+    pop rsi
+    mov [rel cur_arr_sym], rax
+    mov qword [rel cur_dim_idx], 0
     mov rcx, [rsi + 64 + 48]
     call emit_load_local_addr
     ; Array evaluates to pointer to elements
@@ -365,6 +444,8 @@ parse_primary:
 
     cmp qword [rsi + 64 + 16], 1
     je .arr_addr_global
+    mov qword [rel cur_arr_sym], 0
+    mov qword [rel cur_dim_idx], 0
     cmp qword [rsi + 64 + 0], TYPE_STRUCT
     jne .not_struct_global
     cmp qword [rsi + 64 + 8], 0
@@ -383,6 +464,12 @@ parse_primary:
     jmp .ret
 
 .arr_addr_global:
+    push rsi
+    mov rcx, rsi
+    call arr_desc_find
+    pop rsi
+    mov [rel cur_arr_sym], rax
+    mov qword [rel cur_dim_idx], 0
     lea rcx, [rel ident_tmp]
     call emit_load_global_addr
     mov qword [rel expr_type + 8], 1
@@ -557,6 +644,79 @@ parse_postfix:
     call next_token         ; consume '['
     call emit_push_rax      ; push base address
 
+    ; Check if part of N-dimensional array
+    mov r10, [rel cur_arr_sym]
+    test r10, r10
+    jz .simple_index
+
+    ; N-dimensional array!
+    ; r10: sym_ptr(0), dim_count(8), dims(16..)
+    mov r12, [r10 + 8]      ; N = dim_count
+    mov r13, [rel cur_dim_idx] ; k = cur_dim_idx
+
+    ; Calculate stride: product of dims[k+1 .. N-1] * elem_size
+    lea rcx, [rel expr_type]
+    call get_elem_size
+    mov rbx, rax            ; rbx = elem_size
+
+    mov r14, r13
+    inc r14                 ; m = k + 1
+.nd_stride_loop:
+    cmp r14, r12
+    jae .nd_stride_done
+    mov rax, [r10 + 16 + r14 * 8]
+    imul rbx, rax
+    inc r14
+    jmp .nd_stride_loop
+.nd_stride_done:
+
+    ; Parse index expression
+    call parse_expr         ; index in RAX
+    cmp rbx, 1
+    jbe .nd_no_scale
+    emit_indent
+    lea rcx, [rel str_op_imul_imm]
+    call emit_str
+    mov rcx, rbx
+    call emit_u64
+    call emit_nl
+.nd_no_scale:
+    call emit_pop_rcx       ; base address in RCX
+    emit_indent
+    lea rcx, [rel str_op_add]
+    call emit_str
+
+    mov rcx, ']'
+    call expect
+
+    ; Check if this was the last dimension (k == N - 1)
+    mov rax, r12
+    dec rax
+    cmp r13, rax
+    jb .nd_intermediate
+
+    ; Last dimension! Reset cur_arr_sym
+    mov qword [rel cur_arr_sym], 0
+    mov qword [rel cur_dim_idx], 0
+
+    cmp qword [rel expr_type + 0], TYPE_STRUCT
+    je .idx_is_struct
+    lea rcx, [rel expr_type]
+    call get_elem_size
+    mov rcx, rax
+    test rcx, rcx
+    jnz .nd_have_dsz
+    mov rcx, 8
+.nd_have_dsz:
+    call emit_deref
+    jmp .loop
+
+.nd_intermediate:
+    ; Intermediate dimension: keep address as sub-array pointer
+    inc qword [rel cur_dim_idx]
+    jmp .loop
+
+.simple_index:
     ; Save element size
     lea rcx, [rel expr_type]
     call get_elem_size
@@ -881,6 +1041,15 @@ parse_sizeof:
 
 .sz_type:
     call parse_type
+.sz_star_loop:
+    cmp qword [rel tok_type], '*'
+    jne .sz_stars_done
+    inc qword [rel type_tmp + 8]
+    call next_token
+    jmp .sz_star_loop
+.sz_stars_done:
+    lea rcx, [rel type_tmp]
+    call compute_type_size
     mov rax, [rel type_tmp + 40]
 
 .sz_emit:
@@ -1875,17 +2044,32 @@ parse_local_decl:
     call str_copy
     call next_token
 
-    ; Check if array [N]
+    ; Check if array [N] (support N dimensions)
+    xor r13, r13            ; r13 = dim_count
     mov qword [rdi + 16], 0 ; is_array = 0
+    mov qword [rdi + 24], 1 ; total_elements = 1
+.arr_dim_loop:
     cmp qword [rel tok_type], '['
-    jne .no_array
-    call next_token
+    jne .arr_dim_done
+    call next_token         ; consume '['
     mov rax, [rel tok_num]
-    mov [rdi + 24], rax     ; array_len
-    mov qword [rdi + 16], 1 ; is_array = 1
+    test rax, rax
+    jnz .have_loc_dim_sz
+    mov rax, 1
+.have_loc_dim_sz:
+    lea r10, [rel arr_dim_buf]
+    mov [r10 + r13 * 8], rax
+    inc r13
+    imul rax, [rdi + 24]
+    mov [rdi + 24], rax
     call next_token
     mov rcx, ']'
     call expect
+    jmp .arr_dim_loop
+.arr_dim_done:
+    test r13, r13
+    jz .no_array
+    mov qword [rdi + 16], 1 ; is_array = 1
 
 .no_array:
     ; Recompute size
@@ -1897,6 +2081,14 @@ parse_local_decl:
     mov rdx, rdi
     call local_add
     mov rsi, rax            ; LOCAL_ENTRY pointer
+
+    test r13, r13
+    jz .no_loc_arr_desc
+    mov rcx, rsi
+    mov rdx, r13
+    lea r8, [rel arr_dim_buf]
+    call arr_desc_add
+.no_loc_arr_desc:
 
     ; Initializer?
     cmp qword [rel tok_type], '='
@@ -1994,17 +2186,32 @@ parse_global_decl_or_func:
     je .is_function
 
     ; Global variable:
-    ; Optional array
+    ; Optional N-dimensional array
+    xor r13, r13            ; r13 = dim_count
     mov qword [rdi + 16], 0
+    mov qword [rdi + 24], 1
+.glob_arr_dim_loop:
     cmp qword [rel tok_type], '['
-    jne .glob_no_arr
+    jne .glob_arr_dim_done
     call next_token
     mov rax, [rel tok_num]
+    test rax, rax
+    jnz .have_glob_dim_sz
+    mov rax, 1
+.have_glob_dim_sz:
+    lea r10, [rel arr_dim_buf]
+    mov [r10 + r13 * 8], rax
+    inc r13
+    imul rax, [rdi + 24]
     mov [rdi + 24], rax
-    mov qword [rdi + 16], 1
     call next_token
     mov rcx, ']'
     call expect
+    jmp .glob_arr_dim_loop
+.glob_arr_dim_done:
+    test r13, r13
+    jz .glob_no_arr
+    mov qword [rdi + 16], 1
 
 .glob_no_arr:
     mov rcx, rdi
@@ -2036,6 +2243,14 @@ parse_global_decl_or_func:
     mov r9, 1               ; is_defined = 1
     call global_add
 
+    test r13, r13
+    jz .add_glob_no_desc
+    mov rcx, rax            ; GLOBAL_ENTRY pointer
+    mov rdx, r13            ; dim_count
+    lea r8, [rel arr_dim_buf]
+    call arr_desc_add
+.add_glob_no_desc:
+
     mov rcx, ';'
     call expect
     jmp .ret
@@ -2063,6 +2278,14 @@ parse_global_decl_or_func:
     je .params_done
 
 .param_loop:
+    cmp qword [rel tok_type], '.'
+    jne .not_dots
+.skip_dots:
+    call next_token
+    cmp qword [rel tok_type], '.'
+    je .skip_dots
+    jmp .params_done
+.not_dots:
     call parse_type         ; parameter type
     cmp qword [rel tok_type], TOK_IDENT
     jne .param_no_name

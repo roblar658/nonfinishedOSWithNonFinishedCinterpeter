@@ -260,6 +260,15 @@ last_lval_offset        resq 1
 last_lval_size          resq 1
 last_lval_name          resb 64
 
+; Array descriptor table for N-dimensional arrays
+MAX_ARR_DESCS           equ 128
+ARR_DESC_ENTRY_SIZE     equ 80          ; sym_ptr(8), dim_count(8), dims(8*8=64)
+arr_desc_count          resq 1
+arr_desc_table          resb (MAX_ARR_DESCS * ARR_DESC_ENTRY_SIZE)
+cur_arr_sym             resq 1
+cur_dim_idx             resq 1
+arr_dim_buf             resq 16
+
 ; Temporary structs
 type_tmp                resb TYPE_DESC_SIZE
 expr_type               resb TYPE_DESC_SIZE
@@ -280,16 +289,28 @@ main:
     push r13
     sub rsp, 48
 
-    ; Linux / SysV entry: RDI = argc, RSI = argv
-    mov r12, rdi            ; argc
-    mov r13, rsi            ; argv
+    ; Support both Win64 (RCX/RDX) and SysV (RDI/RSI)
+    test rcx, rcx
+    jle .try_sysv
+    cmp rcx, 100
+    jg .try_sysv
+    test rdx, rdx
+    jz .try_sysv
+    mov r12, rcx
+    mov r13, rdx
+    jmp .args_done
+.try_sysv:
+    mov r12, rdi
+    mov r13, rsi
+.args_done:
 
     ; Check argc >= 2
     cmp r12, 2
     jge .args_ok
-    lea rdi, [rel str_usage]
-    xor eax, eax
+    sub rsp, 32
+    lea rcx, [rel str_usage]
     call printf
+    add rsp, 32
     mov eax, 1
     jmp .exit
 
@@ -384,6 +405,9 @@ main:
     mov qword [rel case_count], 0
     mov qword [rel break_stack_depth], 0
     mov qword [rel last_lval_kind], 0
+    mov qword [rel arr_desc_count], 0
+    mov qword [rel cur_arr_sym], 0
+    mov qword [rel cur_dim_idx], 0
 
     ; Prime lexer
     call next_token
@@ -400,10 +424,11 @@ main:
     call write_output_file
 
     ; Print success
-    lea rdi, [rel str_compiled_success]
-    mov rsi, [rel out_filename]
-    xor eax, eax
+    sub rsp, 32
+    lea rcx, [rel str_compiled_success]
+    mov rdx, [rel out_filename]
     call printf
+    add rsp, 32
 
     xor eax, eax
 
@@ -436,17 +461,22 @@ write_output_file:
     sub rsp, 48
 
     ; fopen(out_filename, "wb")
-    mov rdi, [rel out_filename]
-    lea rsi, [rel str_mode_wb]
+    sub rsp, 32
+    mov rcx, [rel out_filename]
+    lea rdx, [rel str_mode_wb]
     call fopen
+    add rsp, 32
     test rax, rax
     jnz .opened_out
-    lea rdi, [rel str_err_open_out]
-    mov rsi, [rel out_filename]
-    xor eax, eax
+    sub rsp, 32
+    lea rcx, [rel str_err_open_out]
+    mov rdx, [rel out_filename]
     call printf
-    mov rdi, 1
+    add rsp, 32
+    sub rsp, 32
+    mov rcx, 1
     call exit
+    add rsp, 32
 
 .opened_out:
     mov [rel file_handle], rax
@@ -656,8 +686,10 @@ write_output_file:
     add rsp, 32
 
 .close_file:
-    mov rdi, r12
+    sub rsp, 32
+    mov rcx, r12
     call fclose
+    add rsp, 32
 
     add rsp, 48
     pop r13
@@ -681,10 +713,14 @@ write_file_str:
     mov rdx, rax            ; byte count in rdx
     test rdx, rdx
     jz .done
-    mov rdi, rsi            ; buffer
-    mov rsi, 1              ; size = 1
-    mov rcx, rbx            ; file
+    ; fwrite(buffer, 1, count, file)
+    mov rcx, rsi            ; buffer
+    mov r8, rdx             ; count
+    mov rdx, 1              ; size = 1
+    mov r9, rbx             ; file
+    sub rsp, 32
     call fwrite
+    add rsp, 32
 .done:
     add rsp, 48
     pop rdi
@@ -727,11 +763,13 @@ write_file_i64:
     push rbx
     sub rsp, 48
     mov rbx, rdx
-    lea rdi, [rel str_neg_sign]
-    mov rsi, 1
+    lea rcx, [rel str_neg_sign]
     mov rdx, 1
-    mov rcx, rbx
+    mov r8, 1
+    mov r9, rbx
+    sub rsp, 32
     call fwrite
+    add rsp, 32
     add rsp, 48
     pop rbx
     pop rdx
